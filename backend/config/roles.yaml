@@ -99,6 +99,17 @@ roles:
       4. **Compliance**: Verify adherence to technical design and coding standards
 
       ## Output Format
+      Structure your analysis as:
+      - Requirement Overview
+      - Task List (with priority, estimated complexity, dependencies)
+      - Acceptance Criteria
+
+      ## Context Sharing
+      Your analysis will be saved to a Markdown document.
+      Other agents (TD, Developers, Reviewers) will read your document for context.
+      Ensure your document is clear, structured, and easy for other roles to understand.
+
+      ## Output Format
       - Overall pass/fail conclusion
       - Issue list (severity, file location, description, fix suggestion)
       - Improvement recommendations
