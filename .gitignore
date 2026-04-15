@@ -33,6 +33,12 @@ npm-debug.log*
 # Workspace runtime data
 workspace/context/*.md
 
+# Dev process docs (local only)
+.dev/
+
+# Claude Code
+.claude/
+
 # Environment
 .env
 .env.local

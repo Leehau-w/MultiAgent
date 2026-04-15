@@ -4,7 +4,7 @@ A visual multi-agent orchestration platform. Create AI agent teams with differen
 
 **Supports multiple LLM providers** — Claude, OpenAI, and Ollama (local models) can work together in the same pipeline.
 
-[English Guide](./docs/USERGUIDE_EN.md) | [中文指南](./docs/USERGUIDE_CN.md) | [Dev Log](./DEVLOG.md)
+[English Guide](./docs/USERGUIDE_EN.md) | [中文指南](./docs/USERGUIDE_CN.md)
 
 ---
 
