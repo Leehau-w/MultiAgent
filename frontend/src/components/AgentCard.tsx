@@ -19,6 +19,21 @@ const STATUS_LABELS: Record<string, string> = {
   error: 'Error',
 }
 
+// Context window sizes by model keyword
+const CONTEXT_WINDOWS: Record<string, number> = {
+  opus: 200_000,
+  sonnet: 200_000,
+  haiku: 200_000,
+}
+
+function getContextWindow(model: string): number {
+  const key = model.toLowerCase()
+  for (const [k, v] of Object.entries(CONTEXT_WINDOWS)) {
+    if (key.includes(k)) return v
+  }
+  return 200_000
+}
+
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
@@ -30,11 +45,17 @@ interface Props {
 }
 
 export default function AgentCard({ agent }: Props) {
-  const { selectedAgentId, selectAgent } = useAgentStore()
+  const { selectedAgentId, selectAgent, roles } = useAgentStore()
   const [showPrompt, setShowPrompt] = useState(false)
   const [prompt, setPrompt] = useState('')
   const isSelected = selectedAgentId === agent.id
   const totalTokens = agent.usage.input_tokens + agent.usage.output_tokens
+
+  const role = roles[agent.role_id]
+  const model = role?.model || '?'
+  const effort = role?.effort || null
+  const contextMax = getContextWindow(model)
+  const contextPct = contextMax > 0 ? Math.min((agent.usage.input_tokens / contextMax) * 100, 100) : 0
 
   const handleStart = async () => {
     if (!prompt.trim()) return
@@ -65,26 +86,54 @@ export default function AgentCard({ agent }: Props) {
     }
   }
 
+  // Color the context bar based on usage
+  const barColor =
+    contextPct >= 90 ? 'bg-red-500' : contextPct >= 70 ? 'bg-yellow-500' : 'bg-indigo-500'
+
   return (
     <>
       <div
         onClick={() => selectAgent(isSelected ? null : agent.id)}
         className={`
-          relative w-[160px] h-[88px] rounded-lg border px-3 py-2 cursor-pointer
-          transition-all select-none flex flex-col justify-between group
+          relative w-[180px] rounded-lg border px-3 py-2 cursor-pointer
+          transition-all select-none flex flex-col gap-1 group
           ${isSelected ? 'border-indigo-500 bg-indigo-500/10' : 'border-gray-700 bg-gray-900 hover:border-gray-600'}
         `}
       >
-        {/* Top row: name + status */}
+        {/* Row 1: name + status dot */}
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-white truncate">{agent.role_name}</span>
           <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_COLORS[agent.status]}`} />
         </div>
 
-        {/* Agent ID */}
-        <div className="text-[11px] text-gray-500 truncate">{agent.id}</div>
+        {/* Row 2: model + effort badges */}
+        <div className="flex items-center gap-1.5 text-[10px]">
+          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 truncate">
+            {model}
+          </span>
+          {effort && (
+            <span className="px-1.5 py-0.5 rounded bg-gray-800 text-amber-400 border border-gray-700">
+              {effort}
+            </span>
+          )}
+        </div>
 
-        {/* Bottom row: status + tokens + cost */}
+        {/* Row 3: context bar */}
+        <div className="flex items-center gap-1.5">
+          <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+              style={{ width: `${contextPct}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-gray-500 w-[32px] text-right shrink-0">
+            {contextPct < 1 && agent.usage.input_tokens > 0
+              ? '<1%'
+              : `${Math.round(contextPct)}%`}
+          </span>
+        </div>
+
+        {/* Row 4: status + tokens + cost */}
         <div className="flex items-center justify-between text-[11px]">
           <span className="text-gray-400">{STATUS_LABELS[agent.status]}</span>
           <span className="text-gray-500">

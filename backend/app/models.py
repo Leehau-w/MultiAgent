@@ -24,6 +24,7 @@ class AgentRole(BaseModel):
     provider: str = "claude"
     model: str = "sonnet"
     max_turns: int = 30
+    effort: str | None = None
 
 
 class AgentUsage(BaseModel):

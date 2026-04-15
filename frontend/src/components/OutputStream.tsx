@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useAgentStore } from '../stores/agentStore'
 
 const TYPE_STYLES: Record<string, string> = {
+  user: 'text-blue-400',
   text: 'text-gray-300',
   tool_use: 'text-yellow-400',
   tool_result: 'text-cyan-400',
@@ -49,6 +50,7 @@ export default function OutputStream() {
             </span>
           )}
           <span className={TYPE_STYLES[entry.type] || 'text-gray-300'}>
+            {entry.type === 'user' && <span className="text-gray-500 mr-1">[you]</span>}
             {entry.type === 'tool_use' && <span className="text-gray-500 mr-1">[tool]</span>}
             {entry.content}
           </span>

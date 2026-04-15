@@ -39,7 +39,7 @@ export default function Dashboard() {
         {!showCreate ? (
           <button
             onClick={() => setShowCreate(true)}
-            className="h-[88px] w-[160px] border border-dashed border-gray-700 rounded-lg
+            className="h-[108px] w-[180px] border border-dashed border-gray-700 rounded-lg
               flex items-center justify-center text-gray-500 hover:text-gray-300
               hover:border-gray-500 transition-colors text-sm"
           >

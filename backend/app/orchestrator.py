@@ -177,6 +177,15 @@ class Orchestrator:
         await self._emit_status(agent_id)
         self.ctx.update_status(agent_id, "running", prompt[:200])
 
+        # Log the user prompt so it appears in the output stream
+        user_entry = OutputEntry(type="user", content=prompt[:2000])
+        agent.output_log.append(user_entry)
+        await self._emit(agent_id, "agent_output", {
+            "type": "user",
+            "text": prompt[:2000],
+            "timestamp": user_entry.timestamp.isoformat(),
+        })
+
         # Build full prompt with context from other agents
         full_prompt = prompt
         if context_from:
@@ -196,6 +205,7 @@ class Orchestrator:
                 cwd=str(self.project_dir),
                 max_turns=role.max_turns,
                 session_id=agent.session_id,
+                effort=role.effort,
             ):
                 await self._handle_provider_message(agent_id, role.model, msg)
 
@@ -264,8 +274,9 @@ class Orchestrator:
             await self._emit(agent_id, "agent_error", {"error": msg.content})
             return
 
-        # text / tool_use / tool_result / result — all go to the output stream
-        if msg.type in ("text", "tool_use", "tool_result", "result") and msg.content:
+        # text / tool_use / tool_result — go to the output stream
+        # "result" is skipped here because it duplicates the last "text" content
+        if msg.type in ("text", "tool_use", "tool_result") and msg.content:
             entry = OutputEntry(type=msg.type, content=msg.content)
             agent.output_log.append(entry)
             await self._emit(agent_id, "agent_output", {

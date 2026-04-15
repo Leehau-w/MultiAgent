@@ -33,6 +33,7 @@ class ProviderAdapter(ABC):
         cwd: str,
         max_turns: int,
         session_id: str | None = None,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderMessage]:
         """Execute an agentic loop, yielding ProviderMessages as work happens.
 

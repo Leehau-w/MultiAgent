@@ -26,6 +26,9 @@ export function useWebSocket(onEvent: WSEventHandler) {
     }
 
     ws.onclose = () => {
+      // Only reconnect if this is still the active WebSocket.
+      // Prevents StrictMode double-mount from creating duplicate connections.
+      if (wsRef.current !== ws) return
       console.log('[WS] Disconnected, reconnecting in 2s...')
       reconnectTimer.current = setTimeout(connect, 2000)
     }
@@ -42,7 +45,9 @@ export function useWebSocket(onEvent: WSEventHandler) {
     connect()
     return () => {
       clearTimeout(reconnectTimer.current)
-      wsRef.current?.close()
+      const ws = wsRef.current
+      wsRef.current = null   // clear ref BEFORE closing so onclose sees mismatch
+      ws?.close()
     }
   }, [connect])
 

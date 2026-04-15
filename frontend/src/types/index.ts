@@ -10,7 +10,7 @@ export interface AgentUsage {
 
 export interface OutputEntry {
   timestamp: string
-  type: 'text' | 'tool_use' | 'tool_result' | 'result' | 'error'
+  type: 'text' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'user'
   content: string
 }
 
@@ -35,6 +35,7 @@ export interface AgentRole {
   system_prompt: string
   tools: string[]
   model: string
+  effort: string | null
 }
 
 export interface WSEvent {

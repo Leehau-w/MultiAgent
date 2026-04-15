@@ -77,6 +77,7 @@ class ClaudeAdapter(ProviderAdapter):
         cwd: str,
         max_turns: int,
         session_id: str | None = None,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderMessage]:
         if not _SDK_AVAILABLE:
             yield ProviderMessage(
@@ -86,7 +87,7 @@ class ClaudeAdapter(ProviderAdapter):
             )
             return
 
-        options = ClaudeAgentOptions(
+        opts: dict = dict(
             allowed_tools=tools,
             model=model,
             system_prompt=system_prompt,
@@ -94,6 +95,9 @@ class ClaudeAdapter(ProviderAdapter):
             max_turns=max_turns,
             resume=session_id,
         )
+        if effort:
+            opts["effort"] = effort
+        options = ClaudeAgentOptions(**opts)
 
         result_text = ""
         final_session_id = session_id
