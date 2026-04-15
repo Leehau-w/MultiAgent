@@ -2,13 +2,13 @@ roles:
   pm:
     name: "Product Manager"
     description: "Requirement analysis, task breakdown, priority management"
+    provider: "claude"
     model: "sonnet"
     max_turns: 15
     tools:
       - Read
       - Glob
       - Grep
-      - WebSearch
     system_prompt: |
       You are a senior Product Manager. Your responsibilities:
 
@@ -31,6 +31,7 @@ roles:
   td:
     name: "Technical Director"
     description: "Architecture design, technical decisions, risk assessment"
+    provider: "claude"
     model: "sonnet"
     max_turns: 20
     tools:
@@ -56,6 +57,7 @@ roles:
   developer:
     name: "Senior Developer"
     description: "Code implementation, unit testing"
+    provider: "claude"
     model: "sonnet"
     max_turns: 40
     tools:
@@ -81,6 +83,7 @@ roles:
   reviewer:
     name: "Code Reviewer"
     description: "Code quality, security, performance review"
+    provider: "claude"
     model: "sonnet"
     max_turns: 15
     tools:
@@ -99,3 +102,38 @@ roles:
       - Overall pass/fail conclusion
       - Issue list (severity, file location, description, fix suggestion)
       - Improvement recommendations
+
+  # ------------------------------------------------------------------ #
+  #  Example: OpenAI roles (uncomment to use)                           #
+  # ------------------------------------------------------------------ #
+  # pm-openai:
+  #   name: "Product Manager (GPT)"
+  #   description: "Requirement analysis using OpenAI"
+  #   provider: "openai"
+  #   model: "gpt-4o-mini"
+  #   max_turns: 15
+  #   tools:
+  #     - Read
+  #     - Glob
+  #     - Grep
+  #   system_prompt: |
+  #     You are a senior Product Manager. ...
+
+  # ------------------------------------------------------------------ #
+  #  Example: Ollama local roles (uncomment to use)                     #
+  # ------------------------------------------------------------------ #
+  # developer-local:
+  #   name: "Developer (Local)"
+  #   description: "Code implementation using local Ollama model"
+  #   provider: "ollama"
+  #   model: "qwen2.5-coder"
+  #   max_turns: 20
+  #   tools:
+  #     - Read
+  #     - Write
+  #     - Edit
+  #     - Bash
+  #     - Glob
+  #     - Grep
+  #   system_prompt: |
+  #     You are a senior developer. ...

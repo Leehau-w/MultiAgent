@@ -21,6 +21,7 @@ class AgentRole(BaseModel):
     description: str
     system_prompt: str
     tools: list[str] = Field(default_factory=list)
+    provider: str = "claude"
     model: str = "sonnet"
     max_turns: int = 30
 

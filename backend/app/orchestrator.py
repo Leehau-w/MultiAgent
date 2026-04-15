@@ -19,51 +19,39 @@ from .models import (
     PipelineStage,
     WSEvent,
 )
+from .providers import ProviderMessage, get_adapter
 from .ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
 
-try:
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        SystemMessage,
-        TextBlock,
-        ToolResultBlock,
-        ToolUseBlock,
-        query,
-    )
-except ImportError:
-    logger.warning(
-        "claude-agent-sdk not installed. Install with: pip install claude-agent-sdk"
-    )
-    query = None  # type: ignore[assignment]
-
-# Pricing per million tokens (approximate, USD) — used as fallback when
-# ResultMessage.total_cost_usd is not available.
+# Fallback pricing per million tokens — used when the provider adapter
+# does not report cost_usd.
 _PRICING: dict[str, dict[str, float]] = {
-    "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_creation": 18.75},
-    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_creation": 3.75},
-    "haiku": {"input": 0.8, "output": 4.0, "cache_read": 0.08, "cache_creation": 1.0},
+    "opus": {"input": 15.0, "output": 75.0},
+    "sonnet": {"input": 3.0, "output": 15.0},
+    "haiku": {"input": 0.8, "output": 4.0},
 }
 
 
 def _estimate_cost(model: str, usage: AgentUsage) -> float:
     key = model.split("-")[0] if "-" in model else model
-    p = _PRICING.get(key, _PRICING["sonnet"])
+    p = _PRICING.get(key, {"input": 3.0, "output": 15.0})
     return (
         usage.input_tokens * p["input"]
         + usage.output_tokens * p["output"]
-        + usage.cache_read_tokens * p["cache_read"]
-        + usage.cache_creation_tokens * p["cache_creation"]
     ) / 1_000_000
 
 
 class Orchestrator:
     """Manages agent lifecycles and coordinates multi-agent pipelines."""
 
-    def __init__(self, ws: WSManager, ctx: ContextManager, config_dir: str, project_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        ws: WSManager,
+        ctx: ContextManager,
+        config_dir: str,
+        project_dir: str | None = None,
+    ) -> None:
         self.ws = ws
         self.ctx = ctx
         self.config_dir = config_dir
@@ -73,7 +61,7 @@ class Orchestrator:
         self.agents: dict[str, AgentState] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._message_queues: dict[str, asyncio.Queue[str]] = {}
-        self._role_map: dict[str, AgentRole] = {}  # agent_id -> role
+        self._role_map: dict[str, AgentRole] = {}
 
     # ------------------------------------------------------------------ #
     #  Role management                                                    #
@@ -124,7 +112,7 @@ class Orchestrator:
         self.agents[agent_id] = state
         self._role_map[agent_id] = role
         self._message_queues[agent_id] = asyncio.Queue()
-        logger.info("Created agent %s (role=%s)", agent_id, role_id)
+        logger.info("Created agent %s (role=%s, provider=%s)", agent_id, role_id, role.provider)
         return state
 
     def delete_agent(self, agent_id: str) -> None:
@@ -153,7 +141,6 @@ class Orchestrator:
         agent = self.get_agent(agent_id)
         if agent.status == AgentStatus.RUNNING:
             raise ValueError(f"Agent {agent_id} is already running")
-
         task = asyncio.create_task(self._run_agent(agent_id, prompt, context_from))
         self._tasks[agent_id] = task
 
@@ -166,11 +153,6 @@ class Orchestrator:
             agent.status = AgentStatus.IDLE
 
     async def send_message(self, agent_id: str, content: str) -> None:
-        """Send a user message to an agent.
-
-        If the agent is idle (has a previous session), resume it with this message.
-        If running, queue the message for delivery after the current turn.
-        """
         agent = self.get_agent(agent_id)
         if agent.status == AgentStatus.IDLE and agent.session_id:
             self.start_agent(agent_id, content)
@@ -185,12 +167,6 @@ class Orchestrator:
         prompt: str,
         context_from: list[str] | None = None,
     ) -> None:
-        if query is None:
-            raise RuntimeError(
-                "claude-agent-sdk is not installed. "
-                "Install with: pip install claude-agent-sdk"
-            )
-
         agent = self.agents[agent_id]
         role = self._role_map[agent_id]
 
@@ -199,10 +175,9 @@ class Orchestrator:
         agent.current_task = prompt[:200]
         agent.usage = AgentUsage()
         await self._emit_status(agent_id)
-
         self.ctx.update_status(agent_id, "running", prompt[:200])
 
-        # Build the full prompt with context from other agents
+        # Build full prompt with context from other agents
         full_prompt = prompt
         if context_from:
             ctx_section = self.ctx.build_context_prompt(context_from)
@@ -210,34 +185,35 @@ class Orchestrator:
                 full_prompt = f"{ctx_section}\n\n---\n\nYour task:\n{prompt}"
 
         try:
-            options = ClaudeAgentOptions(
-                allowed_tools=role.tools,
-                model=role.model,
+            adapter = get_adapter(role.provider)
+            result_text = ""
+
+            async for msg in adapter.run(
+                prompt=full_prompt,
                 system_prompt=role.system_prompt,
+                model=role.model,
+                tools=role.tools,
                 cwd=str(self.project_dir),
                 max_turns=role.max_turns,
-                resume=agent.session_id if agent.session_id else None,
-            )
+                session_id=agent.session_id,
+            ):
+                await self._handle_provider_message(agent_id, role.model, msg)
 
-            result_text = ""
-            async for message in query(prompt=full_prompt, options=options):
-                await self._handle_message(agent_id, role.model, message)
-
-                if isinstance(message, ResultMessage):
-                    agent.session_id = message.session_id
-                    if message.result:
-                        result_text = message.result
-                    # Use SDK-reported cost & usage when available
-                    if message.total_cost_usd is not None:
-                        agent.usage.cost_usd = message.total_cost_usd
-                    if message.usage:
-                        agent.usage.input_tokens = message.usage.get("input_tokens", 0)
-                        agent.usage.output_tokens = message.usage.get("output_tokens", 0)
-                        agent.usage.cache_read_tokens = message.usage.get("cache_read_input_tokens", 0)
-                        agent.usage.cache_creation_tokens = message.usage.get("cache_creation_input_tokens", 0)
+                if msg.type == "result":
+                    if msg.content:
+                        result_text = msg.content
+                    if msg.session_id:
+                        agent.session_id = msg.session_id
+                    if msg.cost_usd is not None:
+                        agent.usage.cost_usd = msg.cost_usd
+                    if msg.usage:
+                        agent.usage.input_tokens = msg.usage.get("input_tokens", agent.usage.input_tokens)
+                        agent.usage.output_tokens = msg.usage.get("output_tokens", agent.usage.output_tokens)
+                        agent.usage.cache_read_tokens = msg.usage.get("cache_read_input_tokens", 0)
+                        agent.usage.cache_creation_tokens = msg.usage.get("cache_creation_input_tokens", 0)
                     await self._emit(agent_id, "agent_usage", agent.usage.model_dump())
 
-            # Save the final result to the context MD file
+            # Save result to context file
             if result_text:
                 self.ctx.set_result(agent_id, role.name, prompt[:200], result_text)
                 await self._emit(agent_id, "context_update", {"content": self.ctx.read(agent_id)})
@@ -245,7 +221,7 @@ class Orchestrator:
             agent.status = AgentStatus.COMPLETED
             agent.finished_at = datetime.now()
 
-            # Check if there are queued messages
+            # Process queued messages
             queue = self._message_queues.get(agent_id)
             if queue and not queue.empty():
                 next_msg = queue.get_nowait()
@@ -265,56 +241,38 @@ class Orchestrator:
             self.ctx.update_status(agent_id, agent.status.value)
             await self._emit_status(agent_id)
 
-    async def _handle_message(self, agent_id: str, model: str, message: Any) -> None:
+    async def _handle_provider_message(
+        self, agent_id: str, model: str, msg: ProviderMessage
+    ) -> None:
         agent = self.agents[agent_id]
 
-        # --- AssistantMessage ---
-        if isinstance(message, AssistantMessage):
-            # Per-message usage tracking
-            if message.usage:
-                u = message.usage
-                agent.usage.input_tokens += u.get("input_tokens", 0)
-                agent.usage.output_tokens += u.get("output_tokens", 0)
-                agent.usage.cache_read_tokens += u.get("cache_read_input_tokens", 0)
-                agent.usage.cache_creation_tokens += u.get("cache_creation_input_tokens", 0)
+        if msg.type == "usage":
+            agent.usage.input_tokens = msg.usage.get("input_tokens", agent.usage.input_tokens)
+            agent.usage.output_tokens = msg.usage.get("output_tokens", agent.usage.output_tokens)
+            agent.usage.cache_read_tokens = msg.usage.get("cache_read_input_tokens", agent.usage.cache_read_tokens)
+            agent.usage.cache_creation_tokens = msg.usage.get("cache_creation_input_tokens", agent.usage.cache_creation_tokens)
+            if msg.cost_usd is not None:
+                agent.usage.cost_usd = msg.cost_usd
+            else:
                 agent.usage.cost_usd = _estimate_cost(model, agent.usage)
-                await self._emit(agent_id, "agent_usage", agent.usage.model_dump())
+            await self._emit(agent_id, "agent_usage", agent.usage.model_dump())
+            return
 
-            # Content blocks
-            for block in message.content:
-                text = ""
-                entry_type = "text"
-                if isinstance(block, TextBlock):
-                    text = block.text
-                elif isinstance(block, ToolUseBlock):
-                    text = f"[Tool: {block.name}] {str(block.input)[:300]}"
-                    entry_type = "tool_use"
-                elif isinstance(block, ToolResultBlock):
-                    text = str(block.content)[:500] if block.content else ""
-                    entry_type = "tool_result"
-                if text:
-                    entry = OutputEntry(type=entry_type, content=text)
-                    agent.output_log.append(entry)
-                    await self._emit(agent_id, "agent_output", {
-                        "type": entry_type,
-                        "text": text,
-                        "timestamp": entry.timestamp.isoformat(),
-                    })
+        if msg.type == "error":
+            entry = OutputEntry(type="error", content=msg.content)
+            agent.output_log.append(entry)
+            await self._emit(agent_id, "agent_error", {"error": msg.content})
+            return
 
-        # --- ResultMessage ---
-        elif isinstance(message, ResultMessage):
-            if message.result:
-                entry = OutputEntry(type="result", content=message.result)
-                agent.output_log.append(entry)
-                await self._emit(agent_id, "agent_output", {
-                    "type": "result",
-                    "text": message.result,
-                    "timestamp": entry.timestamp.isoformat(),
-                })
-
-        # --- SystemMessage (e.g. init) ---
-        elif isinstance(message, SystemMessage):
-            logger.debug("Agent %s system message: subtype=%s", agent_id, message.subtype)
+        # text / tool_use / tool_result / result — all go to the output stream
+        if msg.type in ("text", "tool_use", "tool_result", "result") and msg.content:
+            entry = OutputEntry(type=msg.type, content=msg.content)
+            agent.output_log.append(entry)
+            await self._emit(agent_id, "agent_output", {
+                "type": msg.type,
+                "text": msg.content,
+                "timestamp": entry.timestamp.isoformat(),
+            })
 
     # ------------------------------------------------------------------ #
     #  Pipeline execution                                                 #
@@ -325,12 +283,9 @@ class Orchestrator:
         requirement: str,
         stages: list[PipelineStage] | None = None,
     ) -> None:
-        """Run a multi-stage pipeline. Stages run sequentially; agents within
-        a parallel stage run concurrently."""
         if stages is None:
             stages = self._default_pipeline()
 
-        # Notify pipeline start
         await self.ws.broadcast_raw({
             "type": "pipeline_status",
             "data": {
@@ -341,7 +296,6 @@ class Orchestrator:
             },
         })
 
-        # Create agents for each stage
         stage_agents: list[list[str]] = []
         for stage in stages:
             agent_ids: list[str] = []
@@ -350,7 +304,6 @@ class Orchestrator:
                 agent_ids.append(aid)
             stage_agents.append(agent_ids)
 
-        # Execute stages
         for i, (stage, agent_ids) in enumerate(zip(stages, stage_agents)):
             await self.ws.broadcast_raw({
                 "type": "pipeline_status",
@@ -364,22 +317,22 @@ class Orchestrator:
             prior_ids = [aid for aids in stage_agents[:i] for aid in aids]
 
             if i == 0:
-                prompt = requirement
+                stage_prompt = requirement
             else:
-                prompt = (
+                stage_prompt = (
                     f"Based on the previous agents' work (see their context documents), "
                     f"continue with the following requirement:\n\n{requirement}"
                 )
 
             if stage.parallel:
                 tasks = [
-                    self._run_agent(aid, prompt, context_from=prior_ids)
+                    self._run_agent(aid, stage_prompt, context_from=prior_ids)
                     for aid in agent_ids
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
             else:
                 for aid in agent_ids:
-                    await self._run_agent(aid, prompt, context_from=prior_ids)
+                    await self._run_agent(aid, stage_prompt, context_from=prior_ids)
 
         await self.ws.broadcast_raw({
             "type": "pipeline_status",
