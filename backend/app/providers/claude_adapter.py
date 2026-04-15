@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import queue
+import sys
+from threading import Thread
 from typing import AsyncIterator
 
 from . import register
@@ -26,6 +30,40 @@ try:
 except ImportError:
     _SDK_AVAILABLE = False
     logger.warning("claude-agent-sdk not installed — Claude provider unavailable")
+
+# Windows + Python 3.14: the default SelectorEventLoop does not support
+# subprocesses, but the SDK spawns the Claude CLI as a child process.
+# We detect this once at import time so we can route SDK calls through a
+# dedicated thread running a ProactorEventLoop.
+_NEEDS_PROACTOR = sys.platform == "win32"
+
+
+def _iter_sdk_in_thread(prompt: str, options: ClaudeAgentOptions) -> queue.Queue:
+    """Run the SDK query on a ProactorEventLoop in a background thread.
+
+    Returns a thread-safe queue that receives SDK messages followed by a
+    ``None`` sentinel (success) or an ``Exception`` (failure).
+    """
+    msg_queue: queue.Queue = queue.Queue()
+
+    def _target() -> None:
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def _collect() -> None:
+                async for message in query(prompt=prompt, options=options):
+                    msg_queue.put(message)
+
+            loop.run_until_complete(_collect())
+            msg_queue.put(None)
+        except Exception as exc:
+            msg_queue.put(exc)
+        finally:
+            loop.close()
+
+    thread = Thread(target=_target, daemon=True)
+    thread.start()
+    return msg_queue
 
 
 class ClaudeAdapter(ProviderAdapter):
@@ -62,7 +100,7 @@ class ClaudeAdapter(ProviderAdapter):
         final_usage: dict = {}
         final_cost: float | None = None
 
-        async for message in query(prompt=prompt, options=options):
+        async for message in self._query(prompt, options):
             # --- AssistantMessage ---
             if isinstance(message, AssistantMessage):
                 if message.usage:
@@ -113,6 +151,27 @@ class ClaudeAdapter(ProviderAdapter):
             usage=final_usage,
             cost_usd=final_cost,
         )
+
+    # -------------------------------------------------------------- #
+
+    @staticmethod
+    async def _query(prompt: str, options: ClaudeAgentOptions) -> AsyncIterator:
+        """Yield SDK messages, routing through a ProactorEventLoop thread on Windows."""
+        if not _NEEDS_PROACTOR:
+            async for msg in query(prompt=prompt, options=options):
+                yield msg
+            return
+
+        # Windows path: drain the thread-safe queue from the async side.
+        loop = asyncio.get_running_loop()
+        msg_queue = _iter_sdk_in_thread(prompt, options)
+        while True:
+            item = await loop.run_in_executor(None, msg_queue.get)
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
 
 register("claude", ClaudeAdapter)

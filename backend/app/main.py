@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -21,6 +22,21 @@ from .ws_manager import WSManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# Windows: ensure Claude Code SDK can find git-bash when Git is not at the default path.
+# Walk up from git.exe until we find a directory containing bin/bash.exe.
+if sys.platform == "win32" and not os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
+    import shutil as _shutil
+    _git = _shutil.which("git")
+    if _git:
+        _d = os.path.dirname(os.path.abspath(_git))
+        for _ in range(4):
+            _d = os.path.dirname(_d)
+            _candidate = os.path.join(_d, "bin", "bash.exe")
+            if os.path.isfile(_candidate):
+                os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = _candidate
+                logger.info("Auto-detected CLAUDE_CODE_GIT_BASH_PATH=%s", _candidate)
+                break
 
 # --- Singletons ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
