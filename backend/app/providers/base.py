@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Awaitable, Callable, Literal
 
 
 @dataclass
@@ -34,6 +34,7 @@ class ProviderAdapter(ABC):
         max_turns: int,
         session_id: str | None = None,
         effort: str | None = None,
+        permission_callback: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[ProviderMessage]:
         """Execute an agentic loop, yielding ProviderMessages as work happens.
 

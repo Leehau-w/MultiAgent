@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 from . import register
+from ._permissions import tool_needs_approval
 from .base import ProviderAdapter, ProviderMessage
 from .tools import execute_tool, get_tool_schemas
 
@@ -80,6 +81,8 @@ class OpenAIAdapter(ProviderAdapter):
         cwd: str,
         max_turns: int,
         session_id: str | None = None,
+        effort: str | None = None,
+        permission_callback: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[ProviderMessage]:
         if not _OPENAI_AVAILABLE:
             yield ProviderMessage(
@@ -166,6 +169,25 @@ class OpenAIAdapter(ProviderAdapter):
                     tool_name=fn_name,
                     tool_input=fn_args,
                 )
+
+                # Gate write/execute tools on the same permission channel the
+                # Claude adapter uses.  Read/Glob/Grep and read-only Bash are
+                # classified as safe and run without prompting.
+                if permission_callback and tool_needs_approval(fn_name, fn_args):
+                    try:
+                        allowed = await permission_callback(fn_name, fn_args)
+                    except Exception as exc:
+                        logger.error("Permission callback failed: %s", exc, exc_info=True)
+                        allowed = False
+                    if not allowed:
+                        result = f"[Permission denied] User did not approve {fn_name}"
+                        yield ProviderMessage(type="tool_result", content=result)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                        continue
 
                 result = await execute_tool(fn_name, fn_args, cwd)
                 yield ProviderMessage(

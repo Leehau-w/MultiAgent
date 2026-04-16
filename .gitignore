@@ -32,6 +32,7 @@ npm-debug.log*
 
 # Workspace runtime data
 workspace/context/*.md
+backend/config/recent_projects.json
 
 # Dev process docs (local only)
 .dev/

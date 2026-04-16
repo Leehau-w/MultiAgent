@@ -8,6 +8,7 @@ const TYPE_STYLES: Record<string, string> = {
   tool_result: 'text-cyan-400',
   result: 'text-green-400 font-medium',
   error: 'text-red-400',
+  permission: 'text-yellow-300 italic',
 }
 
 export default function OutputStream() {

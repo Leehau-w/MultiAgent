@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .context_manager import ContextManager
 from .models import (
     CreateAgentRequest,
+    PermissionResponse,
     SendMessageRequest,
     StartAgentRequest,
     StartPipelineRequest,
@@ -47,6 +48,12 @@ RECENT_PROJECTS_FILE = os.path.join(CONFIG_DIR, "recent_projects.json")
 ws_manager = WSManager()
 ctx_manager = ContextManager(WORKSPACE_DIR)
 orchestrator = Orchestrator(ws_manager, ctx_manager, CONFIG_DIR)
+
+# Allow setting initial project via env var (for multi-instance support)
+_initial_project = os.environ.get("MULTIAGENT_PROJECT", "").strip()
+if _initial_project and os.path.isdir(_initial_project):
+    orchestrator.project_dir = os.path.normpath(_initial_project)
+    logger.info("Initial project directory: %s", orchestrator.project_dir)
 
 
 def _load_recent_projects() -> list[str]:
@@ -206,6 +213,12 @@ async def send_message(agent_id: str, req: SendMessageRequest):
 @app.post("/api/agents/{agent_id}/stop")
 async def stop_agent(agent_id: str):
     orchestrator.stop_agent(agent_id)
+    return {"ok": True}
+
+
+@app.post("/api/permission")
+async def resolve_permission(req: PermissionResponse):
+    await orchestrator.resolve_permission(req.request_id, req.allow)
     return {"ok": True}
 
 

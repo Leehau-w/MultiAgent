@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentState, AgentRole, AgentStatus, OutputEntry, WSEvent } from '../types'
+import type { AgentState, AgentRole, AgentStatus, OutputEntry, PermissionRequest, WSEvent } from '../types'
 
 export interface PipelineStage {
   name: string
@@ -21,6 +21,7 @@ interface AgentStore {
   contextCache: Record<string, string>
   outputStreams: Record<string, OutputEntry[]>
   pipeline: PipelineState
+  permissionQueue: PermissionRequest[]
 
   setRoles: (roles: Record<string, AgentRole>) => void
   setAgents: (agents: Record<string, AgentState>) => void
@@ -35,6 +36,7 @@ export const useAgentStore = create<AgentStore>((set) => ({
   contextCache: {},
   outputStreams: {},
   pipeline: { status: 'idle', requirement: '', stages: [], currentStage: 0 },
+  permissionQueue: [],
 
   setRoles: (roles) => set({ roles }),
 
@@ -51,6 +53,32 @@ export const useAgentStore = create<AgentStore>((set) => ({
   handleWSEvent: (event) =>
     set((state) => {
       const { type, agent_id, data } = event
+
+      // Permission request events — dedupe by request_id so a retransmit
+      // from the backend never stacks two cards for the same tool call.
+      if (type === 'agent_permission_request') {
+        const requestId = data.request_id as string
+        if (state.permissionQueue.some((p) => p.request_id === requestId)) {
+          return state
+        }
+        const req: PermissionRequest = {
+          request_id: requestId,
+          agent_id,
+          tool_name: data.tool_name as string,
+          tool_input: (data.tool_input as Record<string, unknown>) || {},
+          timestamp: new Date().toISOString(),
+        }
+        return { permissionQueue: [...state.permissionQueue, req] }
+      }
+
+      if (type === 'agent_permission_resolved') {
+        const requestId = data.request_id as string
+        return {
+          permissionQueue: state.permissionQueue.filter(
+            (p) => p.request_id !== requestId,
+          ),
+        }
+      }
 
       // Pipeline-level events (no agent_id)
       if (type === 'pipeline_status') {
@@ -69,18 +97,26 @@ export const useAgentStore = create<AgentStore>((set) => ({
         case 'agent_status': {
           const agent = state.agents[agent_id]
           if (!agent) return state
+          const nextStatus = (data.status as AgentStatus) || agent.status
+          // If the agent left the running state, drop its pending permission
+          // cards as a safety net in case a resolved event was missed.
+          const clearPermissions =
+            nextStatus !== 'running' && nextStatus !== 'waiting'
           return {
             agents: {
               ...state.agents,
               [agent_id]: {
                 ...agent,
-                status: (data.status as AgentStatus) || agent.status,
+                status: nextStatus,
                 current_task: (data.currentTask as string) ?? agent.current_task,
                 session_id: (data.sessionId as string) ?? agent.session_id,
                 started_at: (data.startedAt as string) ?? agent.started_at,
                 finished_at: (data.finishedAt as string) ?? agent.finished_at,
               },
             },
+            permissionQueue: clearPermissions
+              ? state.permissionQueue.filter((p) => p.agent_id !== agent_id)
+              : state.permissionQueue,
           }
         }
 
@@ -146,6 +182,9 @@ export const useAgentStore = create<AgentStore>((set) => ({
               ...state.outputStreams,
               [agent_id]: [...stream, errEntry],
             },
+            permissionQueue: state.permissionQueue.filter(
+              (p) => p.agent_id !== agent_id,
+            ),
           }
         }
 

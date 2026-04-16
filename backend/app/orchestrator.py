@@ -62,6 +62,7 @@ class Orchestrator:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._message_queues: dict[str, asyncio.Queue[str]] = {}
         self._role_map: dict[str, AgentRole] = {}
+        self._pending_permissions: dict[str, asyncio.Future[bool]] = {}
 
     # ------------------------------------------------------------------ #
     #  Role management                                                    #
@@ -148,9 +149,105 @@ class Orchestrator:
         task = self._tasks.pop(agent_id, None)
         if task and not task.done():
             task.cancel()
+        self._cleanup_pending_permissions(agent_id, reason="stopped")
         agent = self.agents.get(agent_id)
         if agent:
             agent.status = AgentStatus.IDLE
+
+    # ------------------------------------------------------------------ #
+    #  Permission handling                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def request_permission(
+        self,
+        agent_id: str,
+        request_id: str,
+        tool_name: str,
+        tool_input: dict,
+    ) -> bool:
+        """Broadcast a permission request to the UI and wait for a response."""
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_permissions[request_id] = future
+
+        await self._emit(agent_id, "agent_permission_request", {
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        })
+
+        # Log to output stream so the user sees what's pending
+        agent = self.agents[agent_id]
+        entry = OutputEntry(type="permission", content=f"Requesting permission: {tool_name}")
+        agent.output_log.append(entry)
+        await self._emit(agent_id, "agent_output", {
+            "type": "permission",
+            "text": entry.content,
+            "timestamp": entry.timestamp.isoformat(),
+        })
+
+        resolution = "timeout"
+        allowed = False
+        try:
+            allowed = await asyncio.wait_for(future, timeout=300)
+            resolution = "allow" if allowed else "deny"
+            return allowed
+        except asyncio.TimeoutError:
+            logger.warning("Permission request %s timed out", request_id)
+            return False
+        except asyncio.CancelledError:
+            resolution = "cancelled"
+            raise
+        finally:
+            self._pending_permissions.pop(request_id, None)
+            # Fire-and-forget so a CancelledError on the agent task cannot
+            # swallow the UI-sync event and leave the panel holding a
+            # stale request.
+            self._broadcast_resolution(agent_id, request_id, allowed, resolution)
+
+    def _broadcast_resolution(
+        self,
+        agent_id: str,
+        request_id: str,
+        allowed: bool,
+        resolution: str,
+    ) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — nothing to notify.  This only happens when the
+            # helper is triggered from a non-async context during shutdown.
+            return
+        loop.create_task(self._emit(agent_id, "agent_permission_resolved", {
+            "request_id": request_id,
+            "allow": allowed,
+            "resolution": resolution,
+        }))
+
+    def _cleanup_pending_permissions(self, agent_id: str, reason: str = "agent_stopped") -> None:
+        """Deny any permissions still waiting when the agent ends."""
+        prefix = f"{agent_id}-"
+        for request_id in list(self._pending_permissions.keys()):
+            if not request_id.startswith(prefix):
+                continue
+            future = self._pending_permissions.pop(request_id, None)
+            if future and not future.done():
+                future.set_result(False)
+            self._broadcast_resolution(agent_id, request_id, False, reason)
+
+    async def resolve_permission(self, request_id: str, allow: bool) -> None:
+        """Resolve a pending permission request (called from API endpoint).
+
+        The WS broadcast fires from ``request_permission``'s finally block,
+        so here we only have to set the future — every connected client
+        will receive the resolution regardless of which tab clicked Allow.
+        """
+        future = self._pending_permissions.get(request_id)
+        if future and not future.done():
+            future.set_result(allow)
+
+    # ------------------------------------------------------------------ #
+    #  Messaging                                                           #
+    # ------------------------------------------------------------------ #
 
     async def send_message(self, agent_id: str, content: str) -> None:
         agent = self.get_agent(agent_id)
@@ -197,6 +294,11 @@ class Orchestrator:
             adapter = get_adapter(role.provider)
             result_text = ""
 
+            # Build permission callback for this agent
+            async def _perm_cb(tool_name: str, tool_input: dict) -> bool:
+                rid = f"{agent_id}-{uuid.uuid4().hex[:8]}"
+                return await self.request_permission(agent_id, rid, tool_name, tool_input)
+
             async for msg in adapter.run(
                 prompt=full_prompt,
                 system_prompt=role.system_prompt,
@@ -206,6 +308,7 @@ class Orchestrator:
                 max_turns=role.max_turns,
                 session_id=agent.session_id,
                 effort=role.effort,
+                permission_callback=_perm_cb,
             ):
                 await self._handle_provider_message(agent_id, role.model, msg)
 
@@ -248,6 +351,7 @@ class Orchestrator:
             logger.exception("Agent %s failed", agent_id)
         finally:
             self._tasks.pop(agent_id, None)
+            self._cleanup_pending_permissions(agent_id, reason="agent_ended")
             self.ctx.update_status(agent_id, agent.status.value)
             await self._emit_status(agent_id)
 
@@ -257,8 +361,10 @@ class Orchestrator:
         agent = self.agents[agent_id]
 
         if msg.type == "usage":
+            # input_tokens: REPLACE — represents current context window size
             agent.usage.input_tokens = msg.usage.get("input_tokens", agent.usage.input_tokens)
-            agent.usage.output_tokens = msg.usage.get("output_tokens", agent.usage.output_tokens)
+            # output_tokens: ACCUMULATE — each turn generates new output
+            agent.usage.output_tokens += msg.usage.get("output_tokens", 0)
             agent.usage.cache_read_tokens = msg.usage.get("cache_read_input_tokens", agent.usage.cache_read_tokens)
             agent.usage.cache_creation_tokens = msg.usage.get("cache_creation_input_tokens", agent.usage.cache_creation_tokens)
             if msg.cost_usd is not None:

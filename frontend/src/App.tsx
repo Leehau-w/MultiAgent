@@ -5,6 +5,7 @@ import Dashboard from './components/Dashboard'
 import OutputStream from './components/OutputStream'
 import ChatPanel from './components/ChatPanel'
 import ContextViewer from './components/ContextViewer'
+import PermissionPanel from './components/PermissionPanel'
 import PipelineModal from './components/PipelineModal'
 import PipelineProgress from './components/PipelineProgress'
 import ProjectSelector from './components/ProjectSelector'
@@ -70,7 +71,9 @@ function App() {
 
       {/* Main content area */}
       <div className="flex-1 flex min-h-0 border-t border-gray-800">
-        {/* Left: output + chat */}
+        {/* Left: cross-agent permission approvals */}
+        <PermissionPanel />
+        {/* Middle: output + chat */}
         <div className="flex-1 flex flex-col min-w-0 border-r border-gray-800">
           <OutputStream />
           <ChatPanel />

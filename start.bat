@@ -5,7 +5,10 @@ set ROOT_DIR=%~dp0
 set BACKEND_DIR=%ROOT_DIR%backend
 set FRONTEND_DIR=%ROOT_DIR%frontend
 
-:: ---- Configurable ports (change here if default ports are taken) ----
+:: ---- Usage: start.bat [project_path] [backend_port] [frontend_port] ----
+if not "%~1"=="" set MULTIAGENT_PROJECT=%~1
+if not "%~2"=="" set BACKEND_PORT=%~2
+if not "%~3"=="" set FRONTEND_PORT=%~3
 if not defined BACKEND_PORT set BACKEND_PORT=8000
 if not defined FRONTEND_PORT set FRONTEND_PORT=5173
 
@@ -13,6 +16,9 @@ echo.
 echo  ============================================
 echo   MultiAgent Studio
 echo  ============================================
+if defined MULTIAGENT_PROJECT (
+    echo   Project: %MULTIAGENT_PROJECT%
+)
 echo.
 
 :: ---- Check Python ----
@@ -77,11 +83,11 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%FRONTEND_PORT% " ^| findst
 echo.
 echo [Starting] Backend on http://localhost:%BACKEND_PORT% ...
 cd /d "%BACKEND_DIR%"
-start "MultiAgent-Backend" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port %BACKEND_PORT% --reload"
+start "MultiAgent-Backend-%BACKEND_PORT%" cmd /k "set MULTIAGENT_PROJECT=%MULTIAGENT_PROJECT%&& set BACKEND_PORT=%BACKEND_PORT%&& .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port %BACKEND_PORT% --reload"
 
 echo [Starting] Frontend on http://localhost:%FRONTEND_PORT% ...
 cd /d "%FRONTEND_DIR%"
-start "MultiAgent-Frontend" cmd /k "npx vite --port %FRONTEND_PORT%"
+start "MultiAgent-Frontend-%FRONTEND_PORT%" cmd /k "set BACKEND_PORT=%BACKEND_PORT%&& npx vite --port %FRONTEND_PORT%"
 
 :: ---- Wait a moment then open browser ----
 timeout /t 3 /nobreak >nul
@@ -92,6 +98,9 @@ echo  ============================================
 echo   Frontend: http://localhost:%FRONTEND_PORT%
 echo   Backend:  http://localhost:%BACKEND_PORT%
 echo   API Docs: http://localhost:%BACKEND_PORT%/docs
+if defined MULTIAGENT_PROJECT (
+    echo   Project:  %MULTIAGENT_PROJECT%
+)
 echo  ============================================
 echo.
 echo   Press any key to stop all services...

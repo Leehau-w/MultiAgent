@@ -10,7 +10,7 @@ export interface AgentUsage {
 
 export interface OutputEntry {
   timestamp: string
-  type: 'text' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'user'
+  type: 'text' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'user' | 'permission'
   content: string
 }
 
@@ -38,8 +38,26 @@ export interface AgentRole {
   effort: string | null
 }
 
+export interface PermissionRequest {
+  request_id: string
+  agent_id: string
+  tool_name: string
+  tool_input: Record<string, unknown>
+  timestamp: string
+}
+
+export type WSEventType =
+  | 'agent_status'
+  | 'agent_output'
+  | 'agent_usage'
+  | 'context_update'
+  | 'agent_error'
+  | 'pipeline_status'
+  | 'agent_permission_request'
+  | 'agent_permission_resolved'
+
 export interface WSEvent {
-  type: 'agent_status' | 'agent_output' | 'agent_usage' | 'context_update' | 'agent_error' | 'pipeline_status'
+  type: WSEventType
   agent_id: string
   data: Record<string, unknown>
 }

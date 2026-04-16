@@ -71,6 +71,11 @@ class ChatMessage(BaseModel):
 # --- Request / Response models ---
 
 
+class PermissionResponse(BaseModel):
+    request_id: str
+    allow: bool
+
+
 class CreateAgentRequest(BaseModel):
     role_id: str
     agent_id: str | None = None
