@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+PermissionMode = Literal["manual", "workspace", "bypass"]
 
 
 class AgentStatus(str, Enum):
@@ -47,6 +49,7 @@ class AgentState(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     context_file: str = ""
+    permission_mode: PermissionMode | None = None
 
 
 class OutputEntry(BaseModel):
@@ -90,15 +93,15 @@ class SendMessageRequest(BaseModel):
     content: str
 
 
-class StartPipelineRequest(BaseModel):
-    requirement: str
-    stages: list[PipelineStage] | None = None
-
-
 class PipelineStage(BaseModel):
     name: str
     agents: list[str]  # role ids
     parallel: bool = False
+
+
+class StartPipelineRequest(BaseModel):
+    requirement: str
+    stages: list[PipelineStage] | None = None
 
 
 # Rebuild forward refs so AgentState can use OutputEntry

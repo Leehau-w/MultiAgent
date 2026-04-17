@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useAgentStore } from '../stores/agentStore'
-import { apiPost } from '../utils/api'
-import type { PermissionRequest } from '../types'
+import { apiPost, apiPut } from '../utils/api'
+import type { PermissionMode, PermissionRequest } from '../types'
 
 const TOOL_COLORS: Record<string, string> = {
   Write: 'text-orange-300',
@@ -64,8 +64,20 @@ function groupByAgent(queue: PermissionRequest[]): Record<string, PermissionRequ
   return groups
 }
 
+const MODE_LABELS: Record<PermissionMode, string> = {
+  manual: 'Manual',
+  workspace: 'Workspace',
+  bypass: 'Bypass',
+}
+
+const MODE_HINTS: Record<PermissionMode, string> = {
+  manual: 'Every write/exec asks for approval.',
+  workspace: 'Writes inside the project folder auto-approve. Everything else still asks.',
+  bypass: 'Every tool call is auto-approved. Use with caution.',
+}
+
 export default function PermissionPanel() {
-  const { permissionQueue, agents } = useAgentStore()
+  const { permissionQueue, agents, globalPermissionMode } = useAgentStore()
 
   const grouped = useMemo(() => groupByAgent(permissionQueue), [permissionQueue])
   const total = permissionQueue.length
@@ -82,6 +94,10 @@ export default function PermissionPanel() {
     )
   }
 
+  const changeMode = async (mode: PermissionMode) => {
+    await apiPut('/api/permission/mode', { mode })
+  }
+
   return (
     <aside className="w-[300px] shrink-0 flex flex-col border-r border-gray-800 bg-gray-900/40 min-h-0">
       {/* Header */}
@@ -89,25 +105,61 @@ export default function PermissionPanel() {
         <span className="text-[11px] text-gray-500 uppercase tracking-wide">
           Permissions
         </span>
-        {total > 0 ? (
-          <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2">
+          <select
+            value={globalPermissionMode}
+            onChange={(e) => changeMode(e.target.value as PermissionMode)}
+            title={MODE_HINTS[globalPermissionMode]}
+            className={`text-[10px] bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 focus:outline-none focus:border-indigo-500 ${
+              globalPermissionMode === 'bypass'
+                ? 'text-red-300'
+                : globalPermissionMode === 'workspace'
+                ? 'text-yellow-300'
+                : 'text-gray-300'
+            }`}
+          >
+            <option value="manual">Manual</option>
+            <option value="workspace">Workspace</option>
+            <option value="bypass">Bypass</option>
+          </select>
+          {total > 0 ? (
             <span className="text-[11px] text-yellow-400 font-medium animate-pulse">
-              {total} pending
+              {total}
             </span>
-            {total > 1 && (
-              <button
-                onClick={() => resolveMany(permissionQueue, true)}
-                className="text-[10px] px-2 py-0.5 bg-green-700 hover:bg-green-600 text-white rounded"
-                title="Allow every pending request"
-              >
-                Allow all
-              </button>
-            )}
-          </div>
-        ) : (
-          <span className="text-[11px] text-gray-600">idle</span>
-        )}
+          ) : null}
+        </div>
       </div>
+
+      {/* Bypass warning banner */}
+      {globalPermissionMode === 'bypass' && (
+        <div className="px-3 py-2 bg-red-950/60 border-b border-red-900 text-[11px] text-red-200 leading-snug">
+          <div className="font-medium">Bypass mode active</div>
+          <div className="text-red-300/80">
+            All tool calls — including writes outside the project folder and
+            shell commands — are auto-approved.
+          </div>
+        </div>
+      )}
+
+      {/* Workspace mode banner */}
+      {globalPermissionMode === 'workspace' && (
+        <div className="px-3 py-2 bg-yellow-950/40 border-b border-yellow-900 text-[11px] text-yellow-200 leading-snug">
+          Writes inside the project folder auto-approve. Other tools still ask.
+        </div>
+      )}
+
+      {/* Bulk Allow All button */}
+      {total > 1 && (
+        <div className="px-3 py-1.5 border-b border-gray-800">
+          <button
+            onClick={() => resolveMany(permissionQueue, true)}
+            className="w-full text-[11px] px-2 py-1 bg-green-700 hover:bg-green-600 text-white rounded"
+            title="Allow every pending request"
+          >
+            Allow all {total} pending
+          </button>
+        </div>
+      )}
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto min-h-0">

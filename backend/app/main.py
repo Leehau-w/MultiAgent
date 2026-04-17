@@ -64,6 +64,7 @@ def _load_recent_projects() -> list[str]:
 
 
 def _save_recent_projects(projects: list[str]) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(RECENT_PROJECTS_FILE, "w", encoding="utf-8") as f:
         json.dump(projects, f, ensure_ascii=False, indent=2)
 
@@ -220,6 +221,50 @@ async def stop_agent(agent_id: str):
 async def resolve_permission(req: PermissionResponse):
     await orchestrator.resolve_permission(req.request_id, req.allow)
     return {"ok": True}
+
+
+_VALID_MODES = {"manual", "workspace", "bypass"}
+
+
+@app.get("/api/permission/mode")
+async def get_permission_mode():
+    return {
+        "mode": orchestrator.permission_mode,
+        "agents": {
+            aid: a.permission_mode for aid, a in orchestrator.agents.items()
+        },
+    }
+
+
+@app.put("/api/permission/mode")
+async def set_permission_mode(body: dict):
+    mode = body.get("mode")
+    if mode not in _VALID_MODES:
+        raise HTTPException(400, f"Invalid mode: {mode}")
+    orchestrator.set_global_permission_mode(mode)  # type: ignore[arg-type]
+    await ws_manager.broadcast_raw({
+        "type": "permission_mode",
+        "agent_id": "",
+        "data": {"scope": "global", "mode": mode},
+    })
+    return {"ok": True, "mode": mode}
+
+
+@app.put("/api/agents/{agent_id}/permission_mode")
+async def set_agent_permission_mode(agent_id: str, body: dict):
+    mode = body.get("mode")
+    if mode is not None and mode not in _VALID_MODES:
+        raise HTTPException(400, f"Invalid mode: {mode}")
+    try:
+        orchestrator.set_agent_permission_mode(agent_id, mode)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    await ws_manager.broadcast_raw({
+        "type": "permission_mode",
+        "agent_id": agent_id,
+        "data": {"scope": "agent", "agent_id": agent_id, "mode": mode},
+    })
+    return {"ok": True, "agent_id": agent_id, "mode": mode}
 
 
 @app.get("/api/agents/{agent_id}/context")

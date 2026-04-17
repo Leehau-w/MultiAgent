@@ -13,7 +13,18 @@ class ContextManager:
         os.makedirs(self.context_dir, exist_ok=True)
 
     def _path(self, agent_id: str) -> str:
-        return os.path.join(self.context_dir, f"{agent_id}.md")
+        path = os.path.join(self.context_dir, f"{agent_id}.md")
+        # Defense-in-depth: even if upstream validation lets a `../foo` ID
+        # slip through, the resolved path must stay inside context_dir.
+        full = os.path.realpath(path)
+        root = os.path.realpath(self.context_dir)
+        try:
+            if os.path.commonpath([full, root]) != root:
+                raise ValueError(f"Invalid agent_id: {agent_id!r}")
+        except ValueError:
+            # Different drives (Windows) — also not allowed.
+            raise ValueError(f"Invalid agent_id: {agent_id!r}")
+        return path
 
     def create(self, agent_id: str, role_name: str) -> str:
         """Create a fresh context file for an agent. Returns the file path."""

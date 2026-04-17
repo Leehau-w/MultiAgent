@@ -222,7 +222,20 @@ async def _tool_bash(args: dict, cwd: str) -> str:
         stderr=asyncio.subprocess.STDOUT,
         cwd=cwd,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        # Kill the child — otherwise it keeps running past the return and
+        # leaks pipes/descriptors.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return "[Bash timeout] Command exceeded 120s and was killed."
     output = stdout.decode("utf-8", errors="replace")
     if len(output) > 50_000:
         output = output[:50_000] + "\n... (truncated)"

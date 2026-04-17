@@ -41,7 +41,10 @@ export default function OutputStream() {
         <div className="text-gray-600 italic">No output yet. Start an agent to see its output here.</div>
       )}
       {entries.map((entry, i) => (
-        <div key={i} className="flex gap-2 py-0.5">
+        <div
+          key={`${entry.agentId}:${entry.timestamp}:${i}`}
+          className="flex gap-2 py-0.5"
+        >
           <span className="text-gray-600 shrink-0 w-[52px]">
             {new Date(entry.timestamp).toLocaleTimeString('en-GB', { hour12: false })}
           </span>

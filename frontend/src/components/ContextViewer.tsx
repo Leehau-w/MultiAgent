@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import Markdown from 'react-markdown'
 import { useAgentStore } from '../stores/agentStore'
 
@@ -10,29 +10,27 @@ export default function ContextViewer() {
 
   const agentId = selectedAgentId
   const agent = agentId ? agents[agentId] : null
+  const cached = agentId ? contextCache[agentId] : undefined
 
-  // Fetch context when agent is selected
+  // Resolve context: prefer WS cache, fall back to one-shot fetch per agent.
   useEffect(() => {
-    if (!agentId) return
-    // Check cache first (from WebSocket updates)
-    if (contextCache[agentId]) {
-      setContent(contextCache[agentId])
+    if (!agentId) {
+      setContent('')
+      return
+    }
+    if (cached !== undefined) {
+      setContent(cached)
       return
     }
     setLoading(true)
+    let cancelled = false
     fetch(`/api/agents/${agentId}/context`)
       .then((r) => r.json())
-      .then((d) => setContent(d.content || ''))
-      .catch(() => setContent(''))
-      .finally(() => setLoading(false))
-  }, [agentId, contextCache])
-
-  // Update content when cache changes
-  useEffect(() => {
-    if (agentId && contextCache[agentId]) {
-      setContent(contextCache[agentId])
-    }
-  }, [agentId, contextCache])
+      .then((d) => { if (!cancelled) setContent(d.content || '') })
+      .catch(() => { if (!cancelled) setContent('') })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [agentId, cached])
 
   // Usage stats for the selected agent
   const usage = agent?.usage
@@ -93,23 +91,33 @@ function AllContexts() {
   const { agents, contextCache } = useAgentStore()
   const [allContexts, setAllContexts] = useState<Record<string, string>>({})
 
+  // Only refetch when the SET of agent IDs actually changes — otherwise any
+  // unrelated WS event bumps the agents object identity and triggers a
+  // full refetch for every agent.
+  const idsKey = useMemo(() => Object.keys(agents).sort().join(','), [agents])
+
   useEffect(() => {
-    // Fetch all contexts
-    const ids = Object.keys(agents)
+    const ids = idsKey ? idsKey.split(',') : []
+    let cancelled = false
     Promise.all(
       ids.map((id) =>
-        contextCache[id]
+        contextCache[id] !== undefined
           ? Promise.resolve({ id, content: contextCache[id] })
           : fetch(`/api/agents/${id}/context`)
               .then((r) => r.json())
               .then((d) => ({ id, content: d.content || '' })),
       ),
     ).then((results) => {
+      if (cancelled) return
       const map: Record<string, string> = {}
       for (const { id, content } of results) map[id] = content
       setAllContexts(map)
     })
-  }, [agents, contextCache])
+    return () => { cancelled = true }
+    // contextCache changes arrive via WS and should refresh the display;
+    // agent ID set changes arrive via create/delete.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey, contextCache])
 
   return (
     <div className="space-y-4">

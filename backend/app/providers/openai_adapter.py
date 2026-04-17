@@ -103,6 +103,7 @@ class OpenAIAdapter(ProviderAdapter):
 
         total_usage = {"input_tokens": 0, "output_tokens": 0}
         collected_text: list[str] = []
+        stopped_early = False
 
         for turn in range(max_turns):
             # Build request kwargs
@@ -117,15 +118,17 @@ class OpenAIAdapter(ProviderAdapter):
             choice = response.choices[0]
             assistant_msg = choice.message
 
-            # Track usage
+            # Track usage — orchestrator REPLACEs input_tokens (current window
+            # size) and ACCUMULATEs output_tokens (per-turn delta), so we
+            # must yield the per-turn values, not our running total.
             if response.usage:
-                total_usage["input_tokens"] += response.usage.prompt_tokens
+                total_usage["input_tokens"] = response.usage.prompt_tokens
                 total_usage["output_tokens"] += response.usage.completion_tokens
                 yield ProviderMessage(
                     type="usage",
                     usage={
-                        "input_tokens": total_usage["input_tokens"],
-                        "output_tokens": total_usage["output_tokens"],
+                        "input_tokens": response.usage.prompt_tokens,
+                        "output_tokens": response.usage.completion_tokens,
                     },
                 )
 
@@ -136,6 +139,7 @@ class OpenAIAdapter(ProviderAdapter):
 
             # No tool calls → done
             if not assistant_msg.tool_calls:
+                stopped_early = True
                 break
 
             # Build the assistant message for conversation history
@@ -203,7 +207,16 @@ class OpenAIAdapter(ProviderAdapter):
 
             # If the model signaled stop despite tool calls, break
             if choice.finish_reason == "stop":
+                stopped_early = True
                 break
+
+        if not stopped_early:
+            # Loop exhausted max_turns with a tool-calling model still going
+            # — surface this so the user doesn't see a "successful" result
+            # that's actually a cut-off conversation.
+            notice = f"[max_turns={max_turns} reached — truncated]"
+            collected_text.append(notice)
+            yield ProviderMessage(type="text", content=notice)
 
         # Final result
         result_text = "\n".join(collected_text) if collected_text else ""

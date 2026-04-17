@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAgentStore } from '../stores/agentStore'
-import { apiPost, apiDelete } from '../utils/api'
-import type { AgentState } from '../types'
+import { apiPost, apiPut, apiDelete } from '../utils/api'
+import type { AgentState, PermissionMode } from '../types'
 
 const STATUS_COLORS: Record<string, string> = {
   idle: 'bg-gray-500',
@@ -19,6 +19,12 @@ const STATUS_LABELS: Record<string, string> = {
   error: 'Error',
 }
 
+const MODE_CHIP: Record<PermissionMode, { label: string; cls: string }> = {
+  manual: { label: 'manual', cls: 'text-gray-300 border-gray-600' },
+  workspace: { label: 'workspace', cls: 'text-yellow-300 border-yellow-700/70' },
+  bypass: { label: 'bypass', cls: 'text-red-300 border-red-700/70' },
+}
+
 // Context window sizes by model keyword
 const CONTEXT_WINDOWS: Record<string, number> = {
   opus: 200_000,
@@ -34,6 +40,24 @@ function getContextWindow(model: string): number {
   return 200_000
 }
 
+const CLAUDE_SHORT_VERSIONS: Record<string, string> = {
+  opus: 'Opus 4.7',
+  sonnet: 'Sonnet 4.6',
+  haiku: 'Haiku 4.5',
+}
+
+function formatModel(model: string): string {
+  const lower = model.toLowerCase()
+  if (CLAUDE_SHORT_VERSIONS[lower]) return CLAUDE_SHORT_VERSIONS[lower]
+  // Full Claude IDs like "claude-opus-4-7" → "Opus 4.7"
+  const claude = lower.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/)
+  if (claude) {
+    const family = claude[1][0].toUpperCase() + claude[1].slice(1)
+    return `${family} ${claude[2]}.${claude[3]}`
+  }
+  return model
+}
+
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
@@ -45,17 +69,23 @@ interface Props {
 }
 
 export default function AgentCard({ agent }: Props) {
-  const { selectedAgentId, selectAgent, roles } = useAgentStore()
+  const { selectedAgentId, selectAgent, roles, globalPermissionMode } = useAgentStore()
   const [showPrompt, setShowPrompt] = useState(false)
+  const [showModeMenu, setShowModeMenu] = useState(false)
   const [prompt, setPrompt] = useState('')
   const isSelected = selectedAgentId === agent.id
   const totalTokens = agent.usage.input_tokens + agent.usage.output_tokens
 
   const role = roles[agent.role_id]
   const model = role?.model || '?'
+  const modelLabel = formatModel(model)
   const effort = role?.effort || null
   const contextMax = getContextWindow(model)
   const contextPct = contextMax > 0 ? Math.min((agent.usage.input_tokens / contextMax) * 100, 100) : 0
+
+  const effectiveMode: PermissionMode = agent.permission_mode || globalPermissionMode
+  const isOverride = agent.permission_mode !== null
+  const modeChip = MODE_CHIP[effectiveMode]
 
   const handleStart = async () => {
     if (!prompt.trim()) return
@@ -86,6 +116,23 @@ export default function AgentCard({ agent }: Props) {
     }
   }
 
+  const setMode = async (mode: PermissionMode | null) => {
+    await apiPut(`/api/agents/${agent.id}/permission_mode`, { mode })
+    setShowModeMenu(false)
+  }
+
+  const modeRowRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!showModeMenu) return
+    const handler = (e: MouseEvent) => {
+      if (modeRowRef.current && !modeRowRef.current.contains(e.target as Node)) {
+        setShowModeMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showModeMenu])
+
   // Color the context bar based on usage
   const barColor =
     contextPct >= 90 ? 'bg-red-500' : contextPct >= 70 ? 'bg-yellow-500' : 'bg-indigo-500'
@@ -106,15 +153,59 @@ export default function AgentCard({ agent }: Props) {
           <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_COLORS[agent.status]}`} />
         </div>
 
-        {/* Row 2: model + effort badges */}
-        <div className="flex items-center gap-1.5 text-[10px]">
-          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 truncate">
-            {model}
+        {/* Row 2: model + effort + permission mode chip */}
+        <div ref={modeRowRef} className="flex items-center gap-1.5 text-[10px] relative">
+          <span
+            className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 truncate"
+            title={model}
+          >
+            {modelLabel}
           </span>
           {effort && (
             <span className="px-1.5 py-0.5 rounded bg-gray-800 text-amber-400 border border-gray-700">
               {effort}
             </span>
+          )}
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowModeMenu((v) => !v) }}
+            title={
+              isOverride
+                ? `Permission: ${modeChip.label} (override)`
+                : `Permission: ${modeChip.label} (inherit global)`
+            }
+            className={`ml-auto px-1.5 py-0.5 rounded bg-gray-800 border ${modeChip.cls} ${
+              isOverride ? '' : 'border-dashed opacity-80'
+            } hover:opacity-100`}
+          >
+            {isOverride ? modeChip.label : `~${modeChip.label}`}
+          </button>
+          {showModeMenu && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute top-full right-0 mt-1 z-20 bg-gray-900 border border-gray-700 rounded-md shadow-lg p-1 w-[140px]"
+            >
+              <button
+                onClick={() => setMode(null)}
+                className={`w-full text-left px-2 py-1 rounded text-[10px] hover:bg-gray-800 ${
+                  !isOverride ? 'text-indigo-300' : 'text-gray-300'
+                }`}
+              >
+                Inherit global
+              </button>
+              {(['manual', 'workspace', 'bypass'] as PermissionMode[]).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  className={`w-full text-left px-2 py-1 rounded text-[10px] hover:bg-gray-800 ${
+                    agent.permission_mode === m
+                      ? MODE_CHIP[m].cls.split(' ')[0]
+                      : 'text-gray-300'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
           )}
         </div>
 

@@ -14,7 +14,7 @@ import ToastContainer from './components/Toast'
 import type { WSEvent } from './types'
 
 function App() {
-  const { setRoles, setAgents, handleWSEvent } = useAgentStore()
+  const { setRoles, setAgents, setGlobalPermissionMode, handleWSEvent } = useAgentStore()
   const [pipelineOpen, setPipelineOpen] = useState(false)
   const [rolesOpen, setRolesOpen] = useState(false)
 
@@ -35,7 +35,12 @@ function App() {
       .then((r) => r.json())
       .then((d) => setAgents(d.agents))
       .catch(console.error)
-  }, [setRoles, setAgents])
+
+    fetch('/api/permission/mode')
+      .then((r) => r.json())
+      .then((d) => setGlobalPermissionMode(d.mode))
+      .catch(console.error)
+  }, [setRoles, setAgents, setGlobalPermissionMode])
 
   return (
     <div className="h-screen flex flex-col bg-gray-950 text-gray-200">

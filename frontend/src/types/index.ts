@@ -1,5 +1,7 @@
 export type AgentStatus = 'idle' | 'running' | 'waiting' | 'completed' | 'error'
 
+export type PermissionMode = 'manual' | 'workspace' | 'bypass'
+
 export interface AgentUsage {
   input_tokens: number
   output_tokens: number
@@ -26,6 +28,7 @@ export interface AgentState {
   started_at: string | null
   finished_at: string | null
   context_file: string
+  permission_mode: PermissionMode | null
 }
 
 export interface AgentRole {
@@ -34,7 +37,9 @@ export interface AgentRole {
   description: string
   system_prompt: string
   tools: string[]
+  provider: string
   model: string
+  max_turns: number
   effort: string | null
 }
 
@@ -55,6 +60,7 @@ export type WSEventType =
   | 'pipeline_status'
   | 'agent_permission_request'
   | 'agent_permission_resolved'
+  | 'permission_mode'
 
 export interface WSEvent {
   type: WSEventType

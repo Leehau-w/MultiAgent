@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentState, AgentRole, AgentStatus, OutputEntry, PermissionRequest, WSEvent } from '../types'
+import type { AgentState, AgentRole, AgentStatus, OutputEntry, PermissionMode, PermissionRequest, WSEvent } from '../types'
 
 export interface PipelineStage {
   name: string
@@ -22,10 +22,13 @@ interface AgentStore {
   outputStreams: Record<string, OutputEntry[]>
   pipeline: PipelineState
   permissionQueue: PermissionRequest[]
+  globalPermissionMode: PermissionMode
 
   setRoles: (roles: Record<string, AgentRole>) => void
   setAgents: (agents: Record<string, AgentState>) => void
   selectAgent: (id: string | null) => void
+  setGlobalPermissionMode: (mode: PermissionMode) => void
+  setAgentPermissionMode: (agentId: string, mode: PermissionMode | null) => void
   handleWSEvent: (event: WSEvent) => void
 }
 
@@ -37,16 +40,40 @@ export const useAgentStore = create<AgentStore>((set) => ({
   outputStreams: {},
   pipeline: { status: 'idle', requirement: '', stages: [], currentStage: 0 },
   permissionQueue: [],
+  globalPermissionMode: 'manual',
 
   setRoles: (roles) => set({ roles }),
 
-  setAgents: (agents) => {
-    const streams: Record<string, OutputEntry[]> = {}
-    for (const [id, agent] of Object.entries(agents)) {
-      streams[id] = agent.output_log || []
-    }
-    set({ agents, outputStreams: streams })
-  },
+  setGlobalPermissionMode: (mode) => set({ globalPermissionMode: mode }),
+
+  setAgentPermissionMode: (agentId, mode) =>
+    set((state) => {
+      const agent = state.agents[agentId]
+      if (!agent) return state
+      return {
+        agents: {
+          ...state.agents,
+          [agentId]: { ...agent, permission_mode: mode },
+        },
+      }
+    }),
+
+  setAgents: (agents) =>
+    set((state) => {
+      // Merge streams: seed from output_log only if we don't already have
+      // a live stream from the WebSocket. A naive replace would wipe
+      // accumulated realtime output on any refresh.
+      const streams = { ...state.outputStreams }
+      for (const [id, agent] of Object.entries(agents)) {
+        if (!streams[id] || streams[id].length === 0) {
+          streams[id] = agent.output_log || []
+        }
+      }
+      for (const id of Object.keys(streams)) {
+        if (!(id in agents)) delete streams[id]
+      }
+      return { agents, outputStreams: streams }
+    }),
 
   selectAgent: (id) => set({ selectedAgentId: id }),
 
@@ -77,6 +104,25 @@ export const useAgentStore = create<AgentStore>((set) => ({
           permissionQueue: state.permissionQueue.filter(
             (p) => p.request_id !== requestId,
           ),
+        }
+      }
+
+      // Permission mode updates — scope=global flips the default;
+      // scope=agent writes the per-agent override (null = inherit).
+      if (type === 'permission_mode') {
+        const scope = data.scope as 'global' | 'agent'
+        const mode = (data.mode as PermissionMode | null) ?? null
+        if (scope === 'global') {
+          return { globalPermissionMode: (mode || 'manual') as PermissionMode }
+        }
+        const aid = (data.agent_id as string) || agent_id
+        const agent = state.agents[aid]
+        if (!agent) return state
+        return {
+          agents: {
+            ...state.agents,
+            [aid]: { ...agent, permission_mode: mode },
+          },
         }
       }
 
