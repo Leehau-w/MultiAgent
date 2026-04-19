@@ -360,6 +360,22 @@ async def get_agent_context_scoped(project_id: str, agent_id: str):
     return {"agentId": agent_id, "content": project.ctx.read(agent_id)}
 
 
+@app.get("/api/projects/{project_id}/agents/{agent_id}/stream")
+async def get_agent_stream(project_id: str, agent_id: str, limit: int = 500):
+    """Return the rolling tail of the agent's output stream.
+
+    Useful for rehydrating the UI after a backend restart or a tab reload —
+    the in-memory ``output_log`` only holds what's been emitted since
+    startup, but the on-disk stream retains the last 500 entries.
+    """
+    project = _project_or_404(project_id)
+    entries = project.streams.tail(agent_id, limit=limit)
+    return {
+        "agentId": agent_id,
+        "entries": [e.model_dump(mode="json") for e in entries],
+    }
+
+
 # ------------------------------------------------------------------ #
 #  Errors                                                             #
 # ------------------------------------------------------------------ #

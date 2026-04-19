@@ -99,10 +99,12 @@ class Orchestrator:
         for entry in data.get("projects", []):
             try:
                 meta = ProjectMeta(**entry)
-                self.projects[meta.id] = Project(
+                project = Project(
                     meta=meta, ws=self.ws, roles=self.roles,
                     workspace_root=self.workspace_root,
                 )
+                project.rehydrate()
+                self.projects[meta.id] = project
             except Exception as e:
                 logger.warning("Skipping malformed project entry %r: %s", entry, e)
         self.active_project_id = data.get("active")

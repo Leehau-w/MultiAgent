@@ -21,6 +21,7 @@ from .models import (
     ProjectMeta,
     WSEvent,
 )
+from .persistence import AgentStore, StreamStore
 from .providers import ProviderMessage, get_adapter
 from .providers.base import ProviderAdapter
 from .ws_manager import WSManager
@@ -68,6 +69,8 @@ class Project:
         os.makedirs(self.workspace_dir, exist_ok=True)
         self.ctx = ContextManager(self.workspace_dir)
         self.errors = ErrorLog(self.workspace_dir)
+        self.agent_store = AgentStore(self.workspace_dir)
+        self.streams = StreamStore(self.workspace_dir)
 
         self.agents: dict[str, AgentState] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -117,6 +120,7 @@ class Project:
         self.agents[agent_id] = state
         self._role_map[agent_id] = role
         self._message_queues[agent_id] = asyncio.Queue()
+        self._save()
         logger.info(
             "[%s] created agent %s (role=%s, provider=%s)",
             self.id, agent_id, role_id, role.provider,
@@ -126,9 +130,59 @@ class Project:
     def delete_agent(self, agent_id: str) -> None:
         self.stop_agent(agent_id)
         self.ctx.delete(agent_id)
+        self.streams.delete(agent_id)
         self.agents.pop(agent_id, None)
         self._role_map.pop(agent_id, None)
         self._message_queues.pop(agent_id, None)
+        self._save()
+
+    # ------------------------------------------------------------------ #
+    #  Persistence                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _save(self) -> None:
+        """Snapshot agent metadata to disk. Cheap — atomic write."""
+        self.agent_store.save(self.agents)
+
+    def _log_entry(self, agent_id: str, entry: OutputEntry) -> None:
+        """Append to both in-memory output_log and the on-disk stream."""
+        agent = self.agents.get(agent_id)
+        if agent is None:
+            return
+        agent.output_log.append(entry)
+        self.streams.append(agent_id, entry)
+
+    def rehydrate(self) -> None:
+        """Load agents + recent output tail from disk on startup.
+
+        Running tasks cannot survive a restart, so every agent is restored
+        with status=IDLE. Session ids are preserved, so users can resume
+        conversations. Missing roles (a role was removed while the backend
+        was down) skip the entry but log a warning.
+        """
+        for entry in self.agent_store.load():
+            try:
+                state = AgentState(**entry)
+            except Exception as e:
+                logger.warning("[%s] skipping malformed agent entry: %s", self.id, e)
+                continue
+            role = self.roles.get(state.role_id)
+            if role is None:
+                logger.warning(
+                    "[%s] agent %s references missing role %s; skipping",
+                    self.id, state.id, state.role_id,
+                )
+                continue
+            if state.status not in (AgentStatus.IDLE, AgentStatus.COMPLETED, AgentStatus.ERROR):
+                state.status = AgentStatus.IDLE
+            # Reload last 500 stream entries (drops whatever was in output_log)
+            tail = self.streams.tail(state.id, limit=500)
+            if tail:
+                state.output_log = tail
+            self.agents[state.id] = state
+            self._role_map[state.id] = role
+            self._message_queues[state.id] = asyncio.Queue()
+        logger.info("[%s] rehydrated %d agents", self.id, len(self.agents))
 
     def get_agent(self, agent_id: str) -> AgentState:
         agent = self.agents.get(agent_id)
@@ -211,7 +265,7 @@ class Project:
         if agent is None:
             return
         entry = OutputEntry(type="permission", content=msg)
-        agent.output_log.append(entry)
+        self._log_entry(agent_id, entry)
         await self._emit(agent_id, "agent_output", {
             "type": "permission",
             "text": msg,
@@ -234,9 +288,8 @@ class Project:
             "tool_input": tool_input,
         })
 
-        agent = self.agents[agent_id]
         entry = OutputEntry(type="permission", content=f"Requesting permission: {tool_name}")
-        agent.output_log.append(entry)
+        self._log_entry(agent_id, entry)
         await self._emit(agent_id, "agent_output", {
             "type": "permission",
             "text": entry.content,
@@ -345,12 +398,13 @@ class Project:
                 self.ctx.update_status(agent_id, "running", current_prompt[:200])
 
                 user_entry = OutputEntry(type="user", content=current_prompt[:2000])
-                agent.output_log.append(user_entry)
+                self._log_entry(agent_id, user_entry)
                 await self._emit(agent_id, "agent_output", {
                     "type": "user",
                     "text": current_prompt[:2000],
                     "timestamp": user_entry.timestamp.isoformat(),
                 })
+                self._save()
 
                 full_prompt = current_prompt
                 if current_context_from:
@@ -396,7 +450,7 @@ class Project:
                 final=True,
             )
             self.errors.append(info)
-            agent.output_log.append(OutputEntry(type="error", content=info.message))
+            self._log_entry(agent_id, OutputEntry(type="error", content=info.message))
             await self._emit(agent_id, "agent_error", info.model_dump(mode="json"))
             logger.exception("[%s] agent %s failed (%s)", self.id, agent_id, category)
         finally:
@@ -404,6 +458,7 @@ class Project:
             self._cleanup_pending_permissions(agent_id, reason="agent_ended")
             self.ctx.update_status(agent_id, agent.status.value)
             await self._emit_status(agent_id)
+            self._save()
 
     async def _run_sdk_with_retry(
         self,
@@ -495,11 +550,12 @@ class Project:
                     final=False,
                 )
                 self.errors.append(info)
-                agent.output_log.append(
+                self._log_entry(
+                    agent_id,
                     OutputEntry(
                         type="error",
                         content=f"[{category}] {info.message} — retry {attempt} in {delay:.0f}s",
-                    )
+                    ),
                 )
                 await self._emit(agent_id, "agent_error", info.model_dump(mode="json"))
                 logger.warning(
@@ -527,13 +583,13 @@ class Project:
 
         if msg.type == "error":
             entry = OutputEntry(type="error", content=msg.content)
-            agent.output_log.append(entry)
+            self._log_entry(agent_id, entry)
             await self._emit(agent_id, "agent_error", {"error": msg.content})
             return
 
         if msg.type in ("text", "tool_use", "tool_result") and msg.content:
             entry = OutputEntry(type=msg.type, content=msg.content)
-            agent.output_log.append(entry)
+            self._log_entry(agent_id, entry)
             await self._emit(agent_id, "agent_output", {
                 "type": msg.type,
                 "text": msg.content,
