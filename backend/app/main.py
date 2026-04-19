@@ -361,6 +361,32 @@ async def get_agent_context_scoped(project_id: str, agent_id: str):
 
 
 # ------------------------------------------------------------------ #
+#  Errors                                                             #
+# ------------------------------------------------------------------ #
+
+
+def _errors_payload(project: Project, agent_id: str | None, limit: int) -> dict:
+    items = project.errors.list(agent_id=agent_id, limit=limit)
+    return {"errors": [e.model_dump(mode="json") for e in items]}
+
+
+@app.get("/api/errors")
+async def list_errors_legacy(agent_id: str | None = None, limit: int = 100):
+    return _errors_payload(_project_or_404(), agent_id, limit)
+
+
+@app.get("/api/projects/{project_id}/errors")
+async def list_errors_scoped(project_id: str, agent_id: str | None = None, limit: int = 100):
+    return _errors_payload(_project_or_404(project_id), agent_id, limit)
+
+
+@app.delete("/api/projects/{project_id}/errors")
+async def clear_errors_scoped(project_id: str):
+    _project_or_404(project_id).errors.clear()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ #
 #  Permissions                                                        #
 # ------------------------------------------------------------------ #
 

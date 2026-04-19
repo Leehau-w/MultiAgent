@@ -4,11 +4,13 @@ import asyncio
 import logging
 import os
 import re
+import traceback
 import uuid
 from datetime import datetime
 from typing import Any
 
 from .context_manager import ContextManager
+from .errors import ErrorInfo, ErrorLog, classify_error, retry_delay
 from .models import (
     AgentRole,
     AgentState,
@@ -20,6 +22,7 @@ from .models import (
     WSEvent,
 )
 from .providers import ProviderMessage, get_adapter
+from .providers.base import ProviderAdapter
 from .ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,7 @@ class Project:
         self.workspace_dir = os.path.join(workspace_root, meta.id)
         os.makedirs(self.workspace_dir, exist_ok=True)
         self.ctx = ContextManager(self.workspace_dir)
+        self.errors = ErrorLog(self.workspace_dir)
 
         self.agents: dict[str, AgentState] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -354,33 +358,13 @@ class Project:
                     if ctx_section:
                         full_prompt = f"{ctx_section}\n\n---\n\nYour task:\n{current_prompt}"
 
-                result_text = ""
-                async for msg in adapter.run(
-                    prompt=full_prompt,
-                    system_prompt=role.system_prompt,
-                    model=role.model,
-                    tools=role.tools,
-                    cwd=str(self.project_dir),
-                    max_turns=role.max_turns,
-                    session_id=agent.session_id,
-                    effort=role.effort,
-                    permission_callback=_perm_cb,
-                ):
-                    await self._handle_provider_message(agent_id, role.model, msg)
-
-                    if msg.type == "result":
-                        if msg.content:
-                            result_text = msg.content
-                        if msg.session_id:
-                            agent.session_id = msg.session_id
-                        if msg.cost_usd is not None:
-                            agent.usage.cost_usd = msg.cost_usd
-                        if msg.usage:
-                            agent.usage.input_tokens = msg.usage.get("input_tokens", agent.usage.input_tokens)
-                            agent.usage.output_tokens = msg.usage.get("output_tokens", agent.usage.output_tokens)
-                            agent.usage.cache_read_tokens = msg.usage.get("cache_read_input_tokens", 0)
-                            agent.usage.cache_creation_tokens = msg.usage.get("cache_creation_input_tokens", 0)
-                        await self._emit(agent_id, "agent_usage", agent.usage.model_dump())
+                result_text = await self._run_sdk_with_retry(
+                    agent_id=agent_id,
+                    role=role,
+                    adapter=adapter,
+                    full_prompt=full_prompt,
+                    perm_cb=_perm_cb,
+                )
 
                 if result_text:
                     self.ctx.set_result(agent_id, role.name, current_prompt[:200], result_text)
@@ -399,16 +383,130 @@ class Project:
             agent.status = AgentStatus.IDLE
             logger.info("[%s] agent %s cancelled", self.id, agent_id)
             raise
-        except Exception as e:
+        except Exception as exc:
             agent.status = AgentStatus.ERROR
-            agent.output_log.append(OutputEntry(type="error", content=str(e)))
-            await self._emit(agent_id, "agent_error", {"error": str(e)})
-            logger.exception("[%s] agent %s failed", self.id, agent_id)
+            category, _ = classify_error(exc)
+            info = ErrorInfo(
+                agent_id=agent_id,
+                project_id=self.id,
+                category=category,
+                message=str(exc) or type(exc).__name__,
+                stack=traceback.format_exc(),
+                recoverable=False,
+                final=True,
+            )
+            self.errors.append(info)
+            agent.output_log.append(OutputEntry(type="error", content=info.message))
+            await self._emit(agent_id, "agent_error", info.model_dump(mode="json"))
+            logger.exception("[%s] agent %s failed (%s)", self.id, agent_id, category)
         finally:
             self._tasks.pop(agent_id, None)
             self._cleanup_pending_permissions(agent_id, reason="agent_ended")
             self.ctx.update_status(agent_id, agent.status.value)
             await self._emit_status(agent_id)
+
+    async def _run_sdk_with_retry(
+        self,
+        *,
+        agent_id: str,
+        role: AgentRole,
+        adapter: ProviderAdapter,
+        full_prompt: str,
+        perm_cb: Any,
+    ) -> str:
+        """Run one adapter.run() pass with category-aware retries.
+
+        Returns the final ``result`` text from the SDK. If a non-recoverable
+        error occurs or retries are exhausted, re-raises so the outer handler
+        in :meth:`_run_agent` can log a final ErrorInfo and mark the agent
+        errored.
+
+        Each transient error is logged with ``final=False`` and broadcast as
+        ``agent_error`` so the UI can show the retry trail in real time.
+        """
+        agent = self.agents[agent_id]
+        attempt = 0
+
+        while True:
+            result_text = ""
+            # Reset usage for the fresh pass — the previous partial tokens
+            # would otherwise double-count if the SDK restarts mid-call.
+            if attempt > 0:
+                agent.usage = AgentUsage()
+
+            try:
+                async for msg in adapter.run(
+                    prompt=full_prompt,
+                    system_prompt=role.system_prompt,
+                    model=role.model,
+                    tools=role.tools,
+                    cwd=str(self.project_dir),
+                    max_turns=role.max_turns,
+                    session_id=agent.session_id,
+                    effort=role.effort,
+                    permission_callback=perm_cb,
+                ):
+                    await self._handle_provider_message(agent_id, role.model, msg)
+
+                    if msg.type == "result":
+                        if msg.content:
+                            result_text = msg.content
+                        if msg.session_id:
+                            agent.session_id = msg.session_id
+                        if msg.cost_usd is not None:
+                            agent.usage.cost_usd = msg.cost_usd
+                        if msg.usage:
+                            agent.usage.input_tokens = msg.usage.get(
+                                "input_tokens", agent.usage.input_tokens
+                            )
+                            agent.usage.output_tokens = msg.usage.get(
+                                "output_tokens", agent.usage.output_tokens
+                            )
+                            agent.usage.cache_read_tokens = msg.usage.get(
+                                "cache_read_input_tokens", 0
+                            )
+                            agent.usage.cache_creation_tokens = msg.usage.get(
+                                "cache_creation_input_tokens", 0
+                            )
+                        await self._emit(
+                            agent_id, "agent_usage", agent.usage.model_dump()
+                        )
+                return result_text
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                category, recoverable = classify_error(exc)
+                attempt += 1
+                delay = retry_delay(category, attempt) if recoverable else None
+                if delay is None:
+                    # Either unrecoverable or retries exhausted — let outer
+                    # handler log the final record and halt the agent.
+                    raise
+
+                info = ErrorInfo(
+                    agent_id=agent_id,
+                    project_id=self.id,
+                    category=category,
+                    message=str(exc) or type(exc).__name__,
+                    stack=traceback.format_exc(),
+                    recoverable=True,
+                    retry_count=attempt - 1,
+                    final=False,
+                )
+                self.errors.append(info)
+                agent.output_log.append(
+                    OutputEntry(
+                        type="error",
+                        content=f"[{category}] {info.message} — retry {attempt} in {delay:.0f}s",
+                    )
+                )
+                await self._emit(agent_id, "agent_error", info.model_dump(mode="json"))
+                logger.warning(
+                    "[%s] agent %s %s (attempt %d): %s — retrying in %.1fs",
+                    self.id, agent_id, category, attempt, exc, delay,
+                )
+                await asyncio.sleep(delay)
 
     async def _handle_provider_message(
         self, agent_id: str, model: str, msg: ProviderMessage
