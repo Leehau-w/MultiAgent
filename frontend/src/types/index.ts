@@ -65,5 +65,13 @@ export type WSEventType =
 export interface WSEvent {
   type: WSEventType
   agent_id: string
+  project_id?: string
   data: Record<string, unknown>
+}
+
+export interface ProjectMeta {
+  id: string
+  name: string
+  project_dir: string
+  created_at: string
 }

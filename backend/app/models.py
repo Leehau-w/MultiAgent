@@ -58,9 +58,20 @@ class OutputEntry(BaseModel):
     content: str = ""
 
 
+class ProjectMeta(BaseModel):
+    """Metadata about a registered project. Each project has an isolated
+    workspace, agent set, and permission mode.
+    """
+    id: str          # slug, e.g. "anvilite" (folder basename)
+    name: str        # display name; defaults to slug
+    project_dir: str # absolute path to the user's code repo
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class WSEvent(BaseModel):
     type: str  # agent_status | agent_output | agent_usage | context_update | agent_error
     agent_id: str
+    project_id: str = ""  # scopes the event to a specific project
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -102,6 +113,11 @@ class PipelineStage(BaseModel):
 class StartPipelineRequest(BaseModel):
     requirement: str
     stages: list[PipelineStage] | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    project_dir: str
+    name: str | None = None
 
 
 # Rebuild forward refs so AgentState can use OutputEntry

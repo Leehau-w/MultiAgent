@@ -30,8 +30,9 @@ npm-debug.log*
 *.sw?
 .DS_Store
 
-# Workspace runtime data
-workspace/context/*.md
+# Workspace runtime data (per-project agents, context MDs, streams, errors, workflow.yaml)
+workspace/
+!workspace/.gitkeep
 backend/config/recent_projects.json
 
 # Dev process docs (local only)
