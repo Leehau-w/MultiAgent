@@ -360,6 +360,19 @@ async def get_agent_context_scoped(project_id: str, agent_id: str):
     return {"agentId": agent_id, "content": project.ctx.read(agent_id)}
 
 
+def _stream_payload(project: Project, agent_id: str, limit: int) -> dict:
+    entries = project.streams.tail(agent_id, limit=limit)
+    return {
+        "agentId": agent_id,
+        "entries": [e.model_dump(mode="json") for e in entries],
+    }
+
+
+@app.get("/api/agents/{agent_id}/stream")
+async def get_agent_stream_legacy(agent_id: str, limit: int = 500):
+    return _stream_payload(_project_or_404(), agent_id, limit)
+
+
 @app.get("/api/projects/{project_id}/agents/{agent_id}/stream")
 async def get_agent_stream(project_id: str, agent_id: str, limit: int = 500):
     """Return the rolling tail of the agent's output stream.
@@ -368,12 +381,7 @@ async def get_agent_stream(project_id: str, agent_id: str, limit: int = 500):
     the in-memory ``output_log`` only holds what's been emitted since
     startup, but the on-disk stream retains the last 500 entries.
     """
-    project = _project_or_404(project_id)
-    entries = project.streams.tail(agent_id, limit=limit)
-    return {
-        "agentId": agent_id,
-        "entries": [e.model_dump(mode="json") for e in entries],
-    }
+    return _stream_payload(_project_or_404(project_id), agent_id, limit)
 
 
 # ------------------------------------------------------------------ #

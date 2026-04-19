@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useAgentStore } from '../stores/agentStore'
+import { apiFetch } from '../utils/api'
+import type { OutputEntry } from '../types'
 
 const TYPE_STYLES: Record<string, string> = {
   user: 'text-blue-400',
@@ -14,6 +16,34 @@ const TYPE_STYLES: Record<string, string> = {
 export default function OutputStream() {
   const { selectedAgentId, outputStreams, agents } = useAgentStore()
   const endRef = useRef<HTMLDivElement>(null)
+
+  // When the user selects an agent whose local stream is empty, hydrate
+  // from the persistent tail so history survives backend restarts.
+  useEffect(() => {
+    if (!selectedAgentId) return
+    const existing = outputStreams[selectedAgentId]
+    if (existing && existing.length > 0) return
+    let cancelled = false
+    apiFetch(`/api/agents/${encodeURIComponent(selectedAgentId)}/stream?limit=500`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (cancelled || !Array.isArray(d.entries)) return
+        useAgentStore.setState((state) => {
+          // Re-check — a live event may have arrived while we were fetching.
+          if ((state.outputStreams[selectedAgentId] || []).length > 0) return state
+          return {
+            outputStreams: {
+              ...state.outputStreams,
+              [selectedAgentId]: d.entries as OutputEntry[],
+            },
+          }
+        })
+      })
+      .catch(() => {/* handled by apiFetch toast */})
+    return () => {
+      cancelled = true
+    }
+  }, [selectedAgentId, outputStreams])
 
   // Determine which streams to show
   const entries = selectedAgentId

@@ -15,7 +15,14 @@ import ToastContainer from './components/Toast'
 import type { WSEvent } from './types'
 
 function App() {
-  const { setRoles, setAgents, setGlobalPermissionMode, handleWSEvent, errors } = useAgentStore()
+  const {
+    setRoles,
+    setAgents,
+    setGlobalPermissionMode,
+    setErrors,
+    handleWSEvent,
+    errors,
+  } = useAgentStore()
   const [pipelineOpen, setPipelineOpen] = useState(false)
   const [rolesOpen, setRolesOpen] = useState(false)
   const [errorsOpen, setErrorsOpen] = useState(false)
@@ -47,7 +54,16 @@ function App() {
       .then((r) => r.json())
       .then((d) => setGlobalPermissionMode(d.mode))
       .catch(console.error)
-  }, [setRoles, setAgents, setGlobalPermissionMode])
+
+    // Seed the error badge with persisted errors so the count reflects
+    // reality even before the user opens the panel.
+    fetch('/api/errors?limit=200')
+      .then((r) => r.json())
+      .then((d) => {
+        if (Array.isArray(d.errors)) setErrors(d.errors)
+      })
+      .catch(console.error)
+  }, [setRoles, setAgents, setGlobalPermissionMode, setErrors])
 
   return (
     <div className="h-screen flex flex-col bg-gray-950 text-gray-200">
