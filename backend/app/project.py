@@ -29,6 +29,9 @@ from .ws_manager import WSManager
 logger = logging.getLogger(__name__)
 
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_DIRECTIVE_RE = re.compile(r"^>>>\s+(START|SPAWN|DONE)\b\s*(.*?)\s*$", re.MULTILINE)
+
+COORDINATOR_ROLE_ID = "coordinator"
 
 # Fallback pricing per million tokens — used when the provider adapter
 # does not report cost_usd.
@@ -348,6 +351,89 @@ class Project:
         return request_id in self._pending_permissions
 
     # ------------------------------------------------------------------ #
+    #  Coordinator                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _find_coordinator(self) -> str | None:
+        """Return the id of the project's coordinator agent, if one exists
+        and hasn't already been marked ``DONE`` / errored.
+
+        If multiple coordinators are registered we return the most recently
+        created one (dict-insertion order).
+        """
+        last: str | None = None
+        for aid, agent in self.agents.items():
+            if agent.role_id != COORDINATOR_ROLE_ID:
+                continue
+            if agent.status == AgentStatus.ERROR:
+                continue
+            last = aid
+        return last
+
+    async def _notify_coordinator(self, source_agent_id: str, summary: str) -> None:
+        """Enqueue an ``[AGENT_DONE]`` message to the coordinator, if any.
+
+        Never notifies the coordinator about its own completion — that would
+        loop forever.
+        """
+        coord_id = self._find_coordinator()
+        if not coord_id or coord_id == source_agent_id:
+            return
+        msg = (
+            f"[AGENT_DONE] {source_agent_id} finished: {summary[:200]}\n"
+            f"Context written to workspace/{self.id}/context/{source_agent_id}.md"
+        )
+        await self.send_message(coord_id, msg)
+
+    async def _process_coordinator_directives(
+        self, coord_id: str, result_text: str
+    ) -> None:
+        """Parse ``>>>`` directives from the coordinator's last turn and act on them.
+
+        Supported:
+          >>> START <agent_id> <prompt>
+          >>> SPAWN <role_id> <agent_id> <prompt>
+          >>> DONE
+        """
+        if not result_text:
+            return
+        for cmd, raw in _DIRECTIVE_RE.findall(result_text):
+            try:
+                if cmd == "DONE":
+                    agent = self.agents.get(coord_id)
+                    if agent:
+                        agent.status = AgentStatus.COMPLETED
+                        agent.current_task = None
+                    logger.info("[%s] coordinator %s marked DONE", self.id, coord_id)
+                elif cmd == "START":
+                    parts = raw.split(None, 1)
+                    if len(parts) < 2:
+                        logger.warning("[%s] START directive malformed: %r", self.id, raw)
+                        continue
+                    target, prompt = parts[0], parts[1]
+                    if target not in self.agents:
+                        logger.warning("[%s] START references unknown agent %s", self.id, target)
+                        continue
+                    await self.send_message(target, prompt)
+                    logger.info("[%s] coordinator dispatched START -> %s", self.id, target)
+                elif cmd == "SPAWN":
+                    parts = raw.split(None, 2)
+                    if len(parts) < 3:
+                        logger.warning("[%s] SPAWN directive malformed: %r", self.id, raw)
+                        continue
+                    role_id, new_aid, prompt = parts[0], parts[1], parts[2]
+                    self.create_agent(role_id, new_aid)
+                    self.start_agent(new_aid, prompt)
+                    logger.info(
+                        "[%s] coordinator spawned %s (role=%s)",
+                        self.id, new_aid, role_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] coordinator directive %s failed: %s", self.id, cmd, e,
+                )
+
+    # ------------------------------------------------------------------ #
     #  Messaging                                                          #
     # ------------------------------------------------------------------ #
 
@@ -426,6 +512,16 @@ class Project:
 
                 agent.status = AgentStatus.COMPLETED
                 agent.finished_at = datetime.now()
+
+                # Coordinator-specific post-turn handling: parse directives,
+                # then notify *other* agents via the directive dispatcher.
+                # Non-coordinators notify the coordinator about their
+                # completion so it can route next steps.
+                if role.id == COORDINATOR_ROLE_ID:
+                    await self._process_coordinator_directives(agent_id, result_text)
+                else:
+                    summary = (result_text or current_prompt)[:200]
+                    await self._notify_coordinator(agent_id, summary)
 
                 queue = self._message_queues.get(agent_id)
                 if queue is None or queue.empty():
