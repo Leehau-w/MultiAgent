@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentState, AgentRole, AgentStatus, OutputEntry, PermissionMode, PermissionRequest, WSEvent } from '../types'
+import type { AgentState, AgentRole, AgentStatus, ErrorInfo, OutputEntry, PermissionMode, PermissionRequest, WSEvent } from '../types'
 
 export interface PipelineStage {
   name: string
@@ -20,12 +20,15 @@ interface AgentStore {
   selectedAgentId: string | null
   contextCache: Record<string, string>
   outputStreams: Record<string, OutputEntry[]>
+  errors: ErrorInfo[]
   pipeline: PipelineState
   permissionQueue: PermissionRequest[]
   globalPermissionMode: PermissionMode
 
   setRoles: (roles: Record<string, AgentRole>) => void
   setAgents: (agents: Record<string, AgentState>) => void
+  setErrors: (errors: ErrorInfo[]) => void
+  clearErrors: () => void
   selectAgent: (id: string | null) => void
   setGlobalPermissionMode: (mode: PermissionMode) => void
   setAgentPermissionMode: (agentId: string, mode: PermissionMode | null) => void
@@ -38,11 +41,16 @@ export const useAgentStore = create<AgentStore>((set) => ({
   selectedAgentId: null,
   contextCache: {},
   outputStreams: {},
+  errors: [],
   pipeline: { status: 'idle', requirement: '', stages: [], currentStage: 0 },
   permissionQueue: [],
   globalPermissionMode: 'manual',
 
   setRoles: (roles) => set({ roles }),
+
+  setErrors: (errors) => set({ errors }),
+
+  clearErrors: () => set({ errors: [] }),
 
   setGlobalPermissionMode: (mode) => set({ globalPermissionMode: mode }),
 
@@ -213,24 +221,69 @@ export const useAgentStore = create<AgentStore>((set) => ({
         case 'agent_error': {
           const agent = state.agents[agent_id]
           if (!agent) return state
+
+          // Two payload shapes:
+          //  * v0.2.0 ErrorInfo — { id, category, message, final, retry_count, ... }
+          //  * Legacy { error: string } — keep working for older backends
+          const isInfo =
+            typeof data.id === 'string' && typeof data.category === 'string'
+
+          const message = isInfo
+            ? (data.message as string) || 'Unknown error'
+            : (data.error as string) || 'Unknown error'
+          const isFinal = isInfo ? (data.final as boolean) ?? true : true
+
           const errEntry: OutputEntry = {
             timestamp: new Date().toISOString(),
             type: 'error',
-            content: (data.error as string) || 'Unknown error',
+            content: isInfo
+              ? `[${data.category as string}] ${message}${
+                  !isFinal ? ` (retry ${(data.retry_count as number) + 1})` : ''
+                }`
+              : message,
           }
           const stream = state.outputStreams[agent_id] || []
+
+          // Transient retries keep the agent in 'running' — only final
+          // errors flip the card to red.
+          const nextAgent: AgentState = isFinal
+            ? { ...agent, status: 'error' }
+            : agent
+
+          const newError: ErrorInfo | null = isInfo
+            ? {
+                id: data.id as string,
+                timestamp: (data.timestamp as string) || new Date().toISOString(),
+                agent_id,
+                project_id: (data.project_id as string) || '',
+                category: data.category as ErrorInfo['category'],
+                tool: (data.tool as string | null) ?? null,
+                tool_input: (data.tool_input as Record<string, unknown> | null) ?? null,
+                message,
+                stack: (data.stack as string | null) ?? null,
+                recoverable: (data.recoverable as boolean) ?? false,
+                retry_count: (data.retry_count as number) ?? 0,
+                final: isFinal,
+              }
+            : null
+          // Cap the errors list so a runaway agent can't balloon state.
+          const nextErrors = newError
+            ? [...state.errors, newError].slice(-200)
+            : state.errors
+
           return {
             agents: {
               ...state.agents,
-              [agent_id]: { ...agent, status: 'error' },
+              [agent_id]: nextAgent,
             },
             outputStreams: {
               ...state.outputStreams,
               [agent_id]: [...stream, errEntry],
             },
-            permissionQueue: state.permissionQueue.filter(
-              (p) => p.agent_id !== agent_id,
-            ),
+            errors: nextErrors,
+            permissionQueue: isFinal
+              ? state.permissionQueue.filter((p) => p.agent_id !== agent_id)
+              : state.permissionQueue,
           }
         }
 

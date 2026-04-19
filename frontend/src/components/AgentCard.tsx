@@ -86,6 +86,7 @@ export default function AgentCard({ agent }: Props) {
   const effectiveMode: PermissionMode = agent.permission_mode || globalPermissionMode
   const isOverride = agent.permission_mode !== null
   const modeChip = MODE_CHIP[effectiveMode]
+  const isCoordinator = agent.role_id === 'coordinator'
 
   const handleStart = async () => {
     if (!prompt.trim()) return
@@ -144,12 +145,26 @@ export default function AgentCard({ agent }: Props) {
         className={`
           relative w-[180px] rounded-lg border px-3 py-2 cursor-pointer
           transition-all select-none flex flex-col gap-1 group
-          ${isSelected ? 'border-indigo-500 bg-indigo-500/10' : 'border-gray-700 bg-gray-900 hover:border-gray-600'}
+          ${isSelected
+            ? 'border-indigo-500 bg-indigo-500/10'
+            : isCoordinator
+              ? 'border-amber-700/70 bg-amber-950/20 hover:border-amber-600'
+              : 'border-gray-700 bg-gray-900 hover:border-gray-600'}
         `}
       >
         {/* Row 1: name + status dot */}
         <div className="flex items-center justify-between">
-          <span className="text-sm font-medium text-white truncate">{agent.role_name}</span>
+          <span className="text-sm font-medium text-white truncate flex items-center gap-1">
+            {isCoordinator && (
+              <span
+                className="text-[9px] px-1 py-0.5 rounded bg-amber-700/40 text-amber-200 border border-amber-700/60"
+                title="Coordinates other agents"
+              >
+                COORD
+              </span>
+            )}
+            {agent.role_name}
+          </span>
           <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_COLORS[agent.status]}`} />
         </div>
 

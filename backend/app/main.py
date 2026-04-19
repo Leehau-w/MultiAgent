@@ -396,6 +396,12 @@ async def list_errors_scoped(project_id: str, agent_id: str | None = None, limit
     return _errors_payload(_project_or_404(project_id), agent_id, limit)
 
 
+@app.delete("/api/errors")
+async def clear_errors_legacy():
+    _project_or_404().errors.clear()
+    return {"ok": True}
+
+
 @app.delete("/api/projects/{project_id}/errors")
 async def clear_errors_scoped(project_id: str):
     _project_or_404(project_id).errors.clear()

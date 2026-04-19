@@ -51,6 +51,28 @@ export interface PermissionRequest {
   timestamp: string
 }
 
+export type ErrorCategory =
+  | 'tool_error'
+  | 'api_error'
+  | 'auth_error'
+  | 'config_error'
+  | 'sdk_internal'
+
+export interface ErrorInfo {
+  id: string
+  timestamp: string
+  agent_id: string
+  project_id: string
+  category: ErrorCategory
+  tool: string | null
+  tool_input: Record<string, unknown> | null
+  message: string
+  stack: string | null
+  recoverable: boolean
+  retry_count: number
+  final: boolean
+}
+
 export type WSEventType =
   | 'agent_status'
   | 'agent_output'
