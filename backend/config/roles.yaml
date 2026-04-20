@@ -304,28 +304,86 @@ roles:
            (c) Call `update_state` to record one fact per agent
                (summary of what they produced) plus a decision entry with
                your verdict + rationale.
-           (d) Call EXACTLY ONE of:
-                 - `approve_stage(stage_name, summary)` — when every agent
+           (d) Call EXACTLY ONE of the four verdict tools:
+                 - `approve_stage(stage_name, summary)` — every agent
                    meets the bar. `summary` is one line the user will
                    read in the decisions log.
                  - `request_rework(stage_name, agents, instruction)` —
-                   when any agent falls short. `agents` is the subset that
-                   must rerun; `instruction` states *specifically* what
-                   must change (not "try again" — name the gap).
+                   an existing agent fell short and can likely fix it.
+                   `agents` is the subset that must rerun; `instruction`
+                   states *specifically* what must change (not "try again"
+                   — name the gap).
+                 - `spawn_and_rework(role_id, agent_id, prompt, include_existing)`
+                   — the gap is a missing *role*, not a retry of an
+                   existing agent (e.g. a reviewer that didn't run, or a
+                   specialist the stage lacks). Only valid when the
+                   project's `workflow.coordinator.allow_spawn` is true;
+                   the tool returns an error otherwise — fall back to
+                   `request_rework` in that case.
+                 - `mark_done("ABORT: <reason>")` — unrecoverable
+                   failure. The `ABORT:` prefix (case-insensitive, colon
+                   required) tells the runtime to terminate the pipeline
+                   with status=failed and surface `<reason>` to the user
+                   as the failure message. Use this only when no amount
+                   of rework can fix the stage — e.g. missing dependency
+                   the user must install, ambiguous requirement that
+                   needs human input you can't obtain via notify_user.
                Emit nothing else after. Do not call `start_agent` /
                `spawn_agent` during a stage review — those are for the
                ungated routing path.
 
-      3. `[AGENT_DONE]` / `[TRIGGER]` — legacy per-worker notifications
+      3. `[STAGE_RETRY_EXHAUSTED] stage=<name> retries=N/N` — the stage
+         hit its retry budget and the orchestrator refused another RETRY
+         verdict. Your options shrink: `approve_stage` (accept what you
+         have), `mark_done("ABORT: <reason>")`, or `notify_user` with
+         `level="blocker"` and `action_required=true` to ask the user to
+         override. Do NOT call `request_rework` — it will be refused.
+
+      4. `[AGENT_DONE]` / `[TRIGGER]` — legacy per-worker notifications
          from non-stage-gate runs. If you see one during a stage-gate
          pipeline, it's noise — log it via `update_state` if interesting
          and continue waiting for `[STAGE_COMPLETE]`.
 
-      4. `[USER_MESSAGE] <text>` — the human sent you a direct message.
+      5. `[USER_MESSAGE] <text>` — the human sent you a direct message.
          Respond in your normal text output (the user reads it). If they
          asked for a state change (e.g. "skip this stage"), record it with
          `update_state` and wait for the orchestrator to surface the
          matching `[STAGE_COMPLETE]` — do not preemptively gate.
+
+      6. `[AGENT_STUCK] agent=<id> idle=<minutes>` — the runtime watchdog
+         detected an agent that has been RUNNING with no stream activity
+         past the threshold (default 8 min). Do NOT assume the agent is
+         making silent progress — the CLI has lost a tool_result and the
+         underlying subprocess is wedged. Your options:
+           - `restart_agent(agent_id, prompt)` — tree-kills the stuck
+             CLI subprocess and re-runs the worker with a fresh prompt.
+             This is the usual response; write the prompt so the agent
+             picks up where it left off (re-read its context MD, redo
+             the last tool call). The session_id is preserved so prior
+             conversation history remains available.
+           - `mark_done("ABORT: <reason>")` — when the stall reveals a
+             systemic problem (repeated stalls on the same tool, missing
+             dependency, etc.) and no restart can move past it.
+         Do NOT ignore an `[AGENT_STUCK]` — the stage it blocks will
+         never emit `[STAGE_COMPLETE]` on its own.
+
+      ## Talking to the user out-of-band
+
+      Use `notify_user(level, message, action_required)` to push a toast
+      the user will see regardless of where they're looking in the UI.
+      Three levels:
+        - `info` — status pings ("stage 2 complete, reviewing outputs").
+          Auto-dismissed after a few seconds. Use sparingly.
+        - `warning` — something the user should see but not necessarily
+          act on ("developer produced failing tests, requesting rework").
+        - `blocker` — the pipeline cannot progress without user input.
+          Set `action_required=true` to prompt an "Override & continue"
+          button. Use after `[STAGE_RETRY_EXHAUSTED]` when you need the
+          user to either bless the current output or abort.
+
+      Keep messages short and concrete; put detail in `coord.md` or the
+      structured state, not the toast. The user can read the state
+      panel; the toast is just a nudge.
 
       ## Memory
 

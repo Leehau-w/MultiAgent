@@ -128,10 +128,12 @@ class BudgetTracker:
     def check_can_start(self) -> None:
         """Raise :class:`BudgetExceeded` if adding one more running
         agent would cross a cap. Called from :meth:`Project.start_agent`."""
+        # Cumulative check first — it may clear a stale sticky flag if
+        # the user raised the cap in workflow.yaml since the last trip.
+        self._check_cumulative()  # cost / turns / wall-clock
+
         if self._exceeded:
             raise BudgetExceeded(*self._exceeded)
-
-        self._check_cumulative()  # cost / turns / wall-clock
 
         caps = self._caps()
         if caps is None:
@@ -151,32 +153,51 @@ class BudgetTracker:
                 )
 
     def _check_cumulative(self) -> None:
-        """Evaluate cost / turns / wall-clock caps. Raises if tripped
-        and sets the sticky-exceeded flag."""
+        """Evaluate cost / turns / wall-clock caps against the current
+        workflow.yaml. Sets the sticky-exceeded flag when a cap is
+        crossed, and clears it when the tripping condition no longer
+        holds (e.g. the user raised the cap mid-run, or usage was
+        reset). The flag is never cleared to stale data: we re-check
+        every cap against current usage before concluding "not exceeded".
+        """
         caps = self._caps()
         if caps is None:
+            # No caps configured at all — nothing to enforce, so a
+            # previous trip is no longer meaningful.
+            self._exceeded = None
             return
+
+        trip: tuple[str, str] | None = None
         if caps.max_total_cost_usd is not None and self.usage.cost_usd >= caps.max_total_cost_usd:
-            self._trip(
+            trip = (
                 "cost",
                 f"cost ${self.usage.cost_usd:.4f} >= cap ${caps.max_total_cost_usd}",
             )
-        if caps.max_total_turns is not None and self.usage.turns >= caps.max_total_turns:
-            self._trip(
+        elif caps.max_total_turns is not None and self.usage.turns >= caps.max_total_turns:
+            trip = (
                 "turns",
                 f"turns {self.usage.turns} >= cap {caps.max_total_turns}",
             )
-        if caps.max_wall_clock_min is not None and self.usage.started_at is not None:
+        elif caps.max_wall_clock_min is not None and self.usage.started_at is not None:
             mins = self.usage.wall_clock_minutes()
             if mins >= caps.max_wall_clock_min:
-                self._trip(
+                trip = (
                     "wall_clock",
                     f"wall-clock {mins:.1f}m >= cap {caps.max_wall_clock_min}m",
                 )
 
-    def _trip(self, reason: str, detail: str) -> None:
-        self._exceeded = (reason, detail)
-        raise BudgetExceeded(reason, detail)
+        if trip is None:
+            # No cap currently tripped — clear any stale sticky flag so a
+            # user who raised the cap in workflow.yaml sees the change
+            # take effect without needing to reset the tracker.
+            self._exceeded = None
+        else:
+            # First time we notice the trip, raise so the caller can
+            # broadcast ``budget_exceeded``. If the flag was already
+            # set for the same reason, update the detail to the latest
+            # numbers but still raise — the cap is still being violated.
+            self._exceeded = trip
+            raise BudgetExceeded(*trip)
 
     # -------- post-turn update --------
 

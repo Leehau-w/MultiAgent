@@ -23,6 +23,7 @@ from typing import Any, Literal
 EventKind = Literal[
     "agent_completed",
     "agent_error",
+    "agent_stuck",
     "user_message",
     "workflow_started",
     "workflow_completed",

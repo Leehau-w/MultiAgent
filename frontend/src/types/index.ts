@@ -1,4 +1,4 @@
-export type AgentStatus = 'idle' | 'running' | 'waiting' | 'completed' | 'error'
+export type AgentStatus = 'idle' | 'running' | 'waiting' | 'completed' | 'error' | 'stuck'
 
 export type PermissionMode = 'manual' | 'workspace' | 'bypass'
 
@@ -79,6 +79,7 @@ export type WSEventType =
   | 'agent_usage'
   | 'context_update'
   | 'agent_error'
+  | 'agent_stuck'
   | 'pipeline_status'
   | 'agent_permission_request'
   | 'agent_permission_resolved'

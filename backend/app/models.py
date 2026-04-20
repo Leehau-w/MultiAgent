@@ -15,6 +15,7 @@ class AgentStatus(str, Enum):
     WAITING = "waiting"
     COMPLETED = "completed"
     ERROR = "error"
+    STUCK = "stuck"  # watchdog detected no stream activity past the threshold
 
 
 class AgentRole(BaseModel):
@@ -48,6 +49,7 @@ class AgentState(BaseModel):
     usage: AgentUsage = Field(default_factory=AgentUsage)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    last_activity_at: datetime | None = None
     context_file: str = ""
     permission_mode: PermissionMode | None = None
 

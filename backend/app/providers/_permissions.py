@@ -12,10 +12,12 @@ import re
 # Tools that never trigger a permission prompt — they have no side effects.
 READONLY_TOOLS: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
 
-# Bash — read-only command whitelist.
+# Bash — read-only command whitelist.  ``find`` is intentionally NOT in
+# this set because ``find -delete`` / ``find -exec rm`` are destructive;
+# it is handled with a dedicated flag check in :func:`is_readonly_bash`.
 _READONLY_COMMANDS: frozenset[str] = frozenset({
     "ls", "dir", "pwd", "cat", "head", "tail", "wc", "file", "stat",
-    "du", "df", "tree", "which", "type", "echo", "printf", "find",
+    "du", "df", "tree", "which", "type", "echo", "printf",
     "grep", "rg", "ag", "fd", "less", "more", "sort", "uniq", "diff",
     "env", "printenv", "whoami", "hostname", "uname", "date", "id",
     "realpath", "dirname", "basename", "sha256sum", "md5sum",
@@ -25,6 +27,29 @@ _READONLY_GIT_SUBCMDS: frozenset[str] = frozenset({
     "status", "log", "diff", "show", "branch", "tag", "remote",
     "describe", "shortlog", "blame", "ls-files", "ls-tree",
 })
+
+# ``find`` flags that make the invocation destructive or execute arbitrary
+# commands. When any of these appear anywhere in the arguments the whole
+# part is rejected and falls through to the permission prompt.
+_FIND_DESTRUCTIVE_FLAGS: frozenset[str] = frozenset({
+    "-delete",
+    "-exec", "-execdir", "-ok", "-okdir",
+    "-fprint", "-fprint0", "-fprintf", "-fls",
+})
+
+# Shell constructs that smuggle a sub-command past the per-part token check.
+# ``$(…)`` and backticks run a nested command substitution; ``<(…)`` /
+# ``>(…)`` are process substitution; a standalone ``&`` backgrounds the
+# preceding command and lets a second one run after the separator (bash
+# treats ``cmd1 & cmd2`` as two statements, but our split alternation only
+# recognises ``&&``/``||``/``;``/``|``).
+#
+# The ``&`` regex must NOT fire on fd-redirect forms like ``2>&1`` or
+# ``<&0``, so we exclude ``&`` that is immediately preceded by ``>`` or
+# ``<`` (in addition to the obvious ``&&`` / ``& &`` duplicate case).
+_SHELL_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
+_BACKGROUND_AMP_RE = re.compile(r"(?<![&<>])&(?!&)")
+
 
 _READONLY_PREFIXES: tuple[str, ...] = (
     "node --version", "node -v",
@@ -44,6 +69,18 @@ def is_readonly_bash(command: str) -> bool:
     # Skip 2> (stderr redirect to a file descriptor) — detection is rough
     # but good enough; a leading "2>&1" is safe because it redirects to fd 1.
     if re.search(r"(?<![0-9])>|>>", command):
+        return False
+
+    # Reject shell substitution constructs up-front. The per-part token
+    # check below only inspects the *literal* first token, so a whitelisted
+    # command can smuggle a destructive operation inside ``$(…)`` /
+    # backticks / ``<(…)`` / ``>(…)``. Treat all four as side-effectful.
+    if _SHELL_SUBSTITUTION_RE.search(command):
+        return False
+
+    # Reject a standalone ``&`` (bash backgrounding separator). ``&&`` is
+    # fine — the split alternation already handles it as a part boundary.
+    if _BACKGROUND_AMP_RE.search(command):
         return False
 
     # ALL parts of a piped/chained command must be read-only.
@@ -66,6 +103,18 @@ def is_readonly_bash(command: str) -> bool:
             if tokens[1] in _READONLY_GIT_SUBCMDS:
                 continue
             return False
+
+        # ``find`` is read-only only when it carries no destructive flag.
+        # Note ``-fprint`` must match as a *prefix* because it covers the
+        # whole ``-fprint``/``-fprint0``/``-fprintf`` family.
+        if cmd == "find":
+            if any(
+                t == flag or (flag.startswith("-fprint") and t.startswith("-fprint"))
+                for t in tokens[1:]
+                for flag in _FIND_DESTRUCTIVE_FLAGS
+            ):
+                return False
+            continue
 
         if cmd in _READONLY_COMMANDS:
             continue

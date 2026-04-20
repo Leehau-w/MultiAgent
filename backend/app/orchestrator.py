@@ -287,6 +287,20 @@ class Orchestrator:
             else None
         )
         max_stage_retries = raw_max_retries if raw_max_retries is not None else 3
+        # Gate-verdict wall-clock cap. Default 600 s (10 min) applies when
+        # stage-gate is active; a workflow can disable it by explicitly
+        # setting ``gate_timeout_seconds: 0``.
+        raw_gate_timeout = (
+            wf.budget.gate_timeout_seconds
+            if (wf is not None and wf.budget is not None)
+            else None
+        )
+        if raw_gate_timeout is None:
+            gate_timeout: float | None = 600.0
+        elif raw_gate_timeout <= 0:
+            gate_timeout = None
+        else:
+            gate_timeout = float(raw_gate_timeout)
         if coord_enabled and coord_role_id:
             existing = project.agents.get("coord")
             if existing is None:
@@ -379,6 +393,7 @@ class Orchestrator:
                     prior_ids=prior_ids,
                     stage_prompt=stage_prompt,
                     max_stage_retries=max_stage_retries,
+                    gate_timeout=gate_timeout,
                 )
                 if stage_failed:
                     pipeline_failed = True
@@ -427,6 +442,7 @@ class Orchestrator:
         prior_ids: list[str],
         stage_prompt: str,
         max_stage_retries: int | None,
+        gate_timeout: float | None = None,
     ) -> bool:
         """Run one stage, then loop review/rework until the coord APPROVEs.
 
@@ -442,6 +458,10 @@ class Orchestrator:
         us back into the rework path. When the cap is reached, further
         RETRY verdicts are refused with a [STAGE_RETRY_EXHAUSTED] message
         and the loop waits for APPROVE (or pipeline abort / user override).
+
+        ``gate_timeout`` is a wall-clock ceiling (seconds) on how long we
+        wait for a single verdict.  On timeout we flip the pipeline into
+        the pause path with a clear reason instead of blocking forever.
         """
         coord_id = pipeline.coordinator_agent_id
         stage_name = stage.name
@@ -503,7 +523,27 @@ class Orchestrator:
                 )
             await project.ws.stage_gate_review_started(project.id, stage_name)
 
-            await pipeline.gate_verdict_ready.wait()
+            try:
+                if gate_timeout is not None:
+                    await asyncio.wait_for(
+                        pipeline.gate_verdict_ready.wait(),
+                        timeout=gate_timeout,
+                    )
+                else:
+                    await pipeline.gate_verdict_ready.wait()
+            except asyncio.TimeoutError:
+                # Coord never responded. Promote to a pause so the user
+                # can decide (retry / force_advance) instead of wedging.
+                pipeline.pause_reason = (
+                    f"Coordinator did not return a verdict within "
+                    f"{int(gate_timeout or 0)}s for stage {stage_name!r}."
+                )
+                pipeline.gate_verdict_ready.set()
+            if pipeline.cancelled:
+                # reset_pipeline() retired this PipelineState while we
+                # were waiting — abandon the loop and let the new run
+                # take over.
+                return stage_failed
             verdict = pipeline.gate_verdict
             pipeline.gate_verdict = None
             pipeline.gate_verdict_ready.clear()
@@ -528,6 +568,8 @@ class Orchestrator:
                 # Wait for /pipeline/resume → sets resume_action + fires event
                 pipeline.resume_ready.clear()
                 await pipeline.resume_ready.wait()
+                if pipeline.cancelled:
+                    return stage_failed
                 action = pipeline.resume_action
                 pipeline.pause_reason = None
                 pipeline.resume_action = None

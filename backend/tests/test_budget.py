@@ -144,3 +144,84 @@ def test_fresh_BudgetTracker_has_clean_state(project):
     assert tr.usage.cost_usd == 0.0
     assert tr.usage.turns == 0
     assert tr.exceeded is False
+
+
+def test_sticky_flag_clears_when_user_raises_cap(project):
+    """Regression: once _exceeded was set, raising the cap in
+    workflow.yaml had no effect — check_can_start kept failing with a
+    stale detail ("cap 60m" after user had bumped it to 600m) until
+    the tracker was manually reset. Now check_can_start re-evaluates
+    against current usage before consulting the sticky flag.
+    """
+    save_workflow(
+        project.workspace_dir,
+        Workflow(
+            stages=[PipelineStage(name="s", agents=["pm"])],
+            budget=Budget(max_total_cost_usd=1.0),
+        ),
+    )
+    tr = project.budget
+    tr.usage.cost_usd = 1.5
+    with pytest.raises(BudgetExceeded):
+        tr.check_can_start()
+    assert tr.exceeded is True
+
+    # User raises the cap to cover current spend without resetting.
+    save_workflow(
+        project.workspace_dir,
+        Workflow(
+            stages=[PipelineStage(name="s", agents=["pm"])],
+            budget=Budget(max_total_cost_usd=10.0),
+        ),
+    )
+    tr.check_can_start()  # must not raise now
+    assert tr.exceeded is False
+
+
+def test_sticky_flag_clears_when_caps_removed(project):
+    """If workflow.yaml is edited to drop the budget block entirely,
+    any prior trip is no longer meaningful and must clear."""
+    save_workflow(
+        project.workspace_dir,
+        Workflow(
+            stages=[PipelineStage(name="s", agents=["pm"])],
+            budget=Budget(max_total_turns=2),
+        ),
+    )
+    tr = project.budget
+    tr.usage.turns = 5
+    with pytest.raises(BudgetExceeded):
+        tr.check_can_start()
+    assert tr.exceeded is True
+
+    # Drop the budget block.
+    save_workflow(
+        project.workspace_dir,
+        Workflow(stages=[PipelineStage(name="s", agents=["pm"])]),
+    )
+    tr.check_can_start()
+    assert tr.exceeded is False
+
+
+def test_sticky_detail_refreshes_with_current_numbers(project):
+    """When the cap stays tripped across multiple checks, the detail
+    string reported by BudgetExceeded reflects the *current* usage, not
+    the snapshot at first trip. Users re-triggering the check after
+    bumping spend should see the latest number."""
+    save_workflow(
+        project.workspace_dir,
+        Workflow(
+            stages=[PipelineStage(name="s", agents=["pm"])],
+            budget=Budget(max_total_cost_usd=1.0),
+        ),
+    )
+    tr = project.budget
+    tr.usage.cost_usd = 1.5
+    with pytest.raises(BudgetExceeded) as ei1:
+        tr.check_can_start()
+    assert "1.5000" in ei1.value.detail
+
+    tr.usage.cost_usd = 3.0
+    with pytest.raises(BudgetExceeded) as ei2:
+        tr.check_can_start()
+    assert "3.0000" in ei2.value.detail

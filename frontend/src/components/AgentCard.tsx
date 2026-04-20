@@ -9,6 +9,7 @@ const STATUS_COLORS: Record<string, string> = {
   waiting: 'bg-yellow-500',
   completed: 'bg-blue-500',
   error: 'bg-red-500',
+  stuck: 'bg-rose-500 animate-pulse',
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -17,6 +18,7 @@ const STATUS_LABELS: Record<string, string> = {
   waiting: 'Waiting',
   completed: 'Done',
   error: 'Error',
+  stuck: 'Stuck',
 }
 
 const MODE_CHIP: Record<PermissionMode, { label: string; cls: string }> = {
@@ -87,6 +89,7 @@ export default function AgentCard({ agent }: Props) {
   const isOverride = agent.permission_mode !== null
   const modeChip = MODE_CHIP[effectiveMode]
   const isCoordinator = agent.role_id === 'coordinator'
+  const isStuck = agent.status === 'stuck'
 
   const handleStart = async () => {
     if (!prompt.trim()) return
@@ -164,9 +167,11 @@ export default function AgentCard({ agent }: Props) {
           transition-all select-none flex flex-col gap-1 group
           ${isSelected
             ? 'border-indigo-500 bg-indigo-500/10'
-            : isCoordinator
-              ? 'border-amber-700/70 bg-amber-950/20 hover:border-amber-600'
-              : 'border-gray-700 bg-gray-900 hover:border-gray-600'}
+            : isStuck
+              ? 'border-rose-600/80 bg-rose-950/30 hover:border-rose-500'
+              : isCoordinator
+                ? 'border-amber-700/70 bg-amber-950/20 hover:border-amber-600'
+                : 'border-gray-700 bg-gray-900 hover:border-gray-600'}
         `}
       >
         {/* Row 1: name + status dot */}
@@ -258,7 +263,12 @@ export default function AgentCard({ agent }: Props) {
 
         {/* Row 4: status + tokens + cost */}
         <div className="flex items-center justify-between text-[11px]">
-          <span className="text-gray-400">{STATUS_LABELS[agent.status]}</span>
+          <span
+            className={isStuck ? 'text-rose-300 font-semibold' : 'text-gray-400'}
+            title={isStuck ? 'Watchdog flagged this agent — coord should restart or abort' : undefined}
+          >
+            {STATUS_LABELS[agent.status]}
+          </span>
           <span className="text-gray-500">
             {formatTokens(totalTokens)} tok
           </span>

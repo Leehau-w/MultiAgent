@@ -36,12 +36,19 @@ export default function NotificationsContainer() {
   const notifications = useAgentStore((s) => s.notifications)
   const dismissNotification = useAgentStore((s) => s.dismissNotification)
   const seedNotifications = useAgentStore((s) => s.seedNotifications)
+  const currentProjectPath = useAgentStore((s) => s.currentProjectPath)
+  const pipelineStatus = useAgentStore((s) => s.pipeline.status)
   const [overflowOpen, setOverflowOpen] = useState(false)
 
   // Replay endpoint fetch on mount — a newly-opened browser tab needs to
   // see outstanding blockers that fired before it connected.
+  // Re-fires on project switch (currentProjectPath dep) so stale notifications
+  // from the previous project don't linger.
   useEffect(() => {
     let cancelled = false
+    // Clear before the fetch so the old project's items don't flash during
+    // the round-trip. seedNotifications([]) wipes in place.
+    seedNotifications([])
     fetch('/api/notifications?limit=200')
       .then((r) => (r.ok ? r.json() : { notifications: [] }))
       .then((d) => {
@@ -70,7 +77,7 @@ export default function NotificationsContainer() {
     return () => {
       cancelled = true
     }
-  }, [seedNotifications])
+  }, [seedNotifications, currentProjectPath])
 
   // Auto-dismiss info toasts after INFO_DISMISS_MS.
   useEffect(() => {
@@ -104,7 +111,12 @@ export default function NotificationsContainer() {
           notification={n}
           onDismiss={() => dismissNotification(n.id)}
           onOverride={
-            n.action_required
+            // The override button posts to /api/pipeline/approve, which
+            // only makes sense when the pipeline is paused at a stage
+            // gate. Any other state (idle/running/completed/failed)
+            // would 409/400, so hide the button rather than let the
+            // user click a dead control.
+            n.action_required && pipelineStatus === 'paused'
               ? async () => {
                   await overrideStage(
                     `override via blocker: ${n.message.slice(0, 200)}`,

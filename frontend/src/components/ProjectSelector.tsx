@@ -17,6 +17,7 @@ export default function ProjectSelector() {
       .then((d) => {
         setProjectPath(d.path || '')
         setRecent(d.recent || [])
+        useAgentStore.getState().setCurrentProjectPath(d.path || '')
       })
       .catch(() => {})
   }, [])
@@ -41,6 +42,10 @@ export default function ProjectSelector() {
       setRecent(d.recent || [])
       setOpen(false)
       setInputValue('')
+      // Publish the new path so project-scoped effects (notifications
+      // replay, etc.) can re-key off it — without this, stale data from
+      // the previous project stays visible until a WS event arrives.
+      useAgentStore.getState().setCurrentProjectPath(d.path)
       useAgentStore.getState().refreshWorkflow()
       useToastStore.getState().add('success', `Switched to ${d.path}`)
     }

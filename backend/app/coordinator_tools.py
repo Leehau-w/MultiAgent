@@ -55,6 +55,22 @@ def _err(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _spawn_allowed(project: "Project") -> bool:
+    """Return True when the project's workflow permits the coord to spawn
+    fresh agents.  Used by both ``spawn_agent`` and ``spawn_and_rework``
+    so the ``workflow.coordinator.allow_spawn`` switch can't be bypassed
+    by picking the looser tool.
+    """
+    from .workflow import load_workflow
+
+    wf = load_workflow(project.workspace_dir)
+    return bool(
+        wf is not None
+        and wf.coordinator is not None
+        and wf.coordinator.allow_spawn
+    )
+
+
 def build_coordinator_tools(project: "Project") -> list[Any]:
     """Return the ``SdkMcpTool`` objects the coordinator can invoke, wiring
     each handler to *project*. Exposed separately from the server so tests
@@ -88,9 +104,37 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
         return _ok(f"Dispatched to {agent_id}.")
 
     @tool(
+        "restart_agent",
+        "Force-stop a stuck or running agent (tree-kills its CLI subprocess) "
+        "and re-run it with a fresh prompt. Use this when list_agents shows "
+        "an agent stuck on a tool call with no stream activity, or when you "
+        "need to bail out of a bad branch of reasoning. Preserves the "
+        "agent's session_id so conversation history is kept.",
+        {"agent_id": str, "prompt": str},
+    )
+    async def _restart_agent(args: dict[str, Any]) -> dict[str, Any]:
+        agent_id = str(args.get("agent_id", "")).strip()
+        prompt = str(args.get("prompt", "")).strip()
+        if not agent_id or not prompt:
+            return _err("restart_agent requires non-empty agent_id and prompt")
+        if agent_id not in project.agents:
+            known = ", ".join(project.agents) or "(none)"
+            return _err(f"No such agent: {agent_id}. Known agents: {known}")
+        try:
+            # stop_agent is sync-callable and schedules the async finalize
+            # on the running loop; safe to call from a tool handler.
+            project.stop_agent(agent_id)
+            project.start_agent(agent_id, prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] coord restart_agent failed: %s", project.id, exc)
+            return _err(f"Restart failed: {exc}")
+        return _ok(f"Restarted {agent_id} with a fresh prompt.")
+
+    @tool(
         "spawn_agent",
         "Create a fresh agent of a given role and run it with a starting prompt. "
-        "The agent_id must be unique within the project.",
+        "The agent_id must be unique within the project. Gated by "
+        "workflow.coordinator.allow_spawn — refused when spawning is disabled.",
         {"role_id": str, "agent_id": str, "prompt": str},
     )
     async def _spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
@@ -99,6 +143,12 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
         prompt = str(args.get("prompt", "")).strip()
         if not role_id or not agent_id or not prompt:
             return _err("spawn_agent requires role_id, agent_id, prompt")
+        if not _spawn_allowed(project):
+            return _err(
+                "spawn_agent refused: workflow.coordinator.allow_spawn is "
+                "false.  Use start_agent on an existing agent, or ask the "
+                "user to enable spawning."
+            )
         try:
             project.create_agent(role_id, agent_id)
             project.start_agent(agent_id, prompt)
@@ -113,9 +163,10 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
         "runtime stops forwarding [AGENT_DONE] events, so call it only when "
         "you truly have no further routing decisions to make. When a "
         "stage-gate pipeline is active and the ``reason`` starts with "
-        "'ABORT:' (case-sensitive), the pipeline is terminated with "
-        "status=failed and the reason surfaces to the user as the failure "
-        "message — use this for unrecoverable failures that rework cannot fix.",
+        "'ABORT:' (case-insensitive, trailing colon required), the pipeline "
+        "is terminated with status=failed and the reason surfaces to the "
+        "user as the failure message — use this for unrecoverable failures "
+        "that rework cannot fix.",
         {"reason": str},
     )
     async def _mark_done(args: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +174,12 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
         from .project import GateVerdict  # local import to avoid cycle
 
         reason = str(args.get("reason", "")).strip() if isinstance(args, dict) else ""
-        is_abort = reason.startswith("ABORT:")
+        # Tolerate casing and whitespace variants — the coord tends to
+        # vary on "ABORT:" / "Abort:" / "abort :" / "[ABORT]".  We normalise
+        # by stripping brackets + whitespace and lowercasing, then look
+        # for a leading ``abort`` followed by a colon separator.
+        normalised = reason.lstrip("[ ").lower()
+        is_abort = normalised.startswith("abort:") or normalised.startswith("abort :")
 
         # Route ABORT through the gate-verdict channel when a stage review
         # is actually pending — the orchestrator treats it as a failed
@@ -447,7 +503,6 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
     )
     async def _spawn_and_rework(args: dict[str, Any]) -> dict[str, Any]:
         from .project import GateVerdict  # local import to avoid cycle
-        from .workflow import load_workflow
 
         role_id = str(args.get("role_id", "")).strip()
         agent_id = str(args.get("agent_id", "")).strip()
@@ -469,14 +524,7 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
                 "A verdict has already been recorded for this stage. "
                 "Wait for the next [STAGE_COMPLETE] before gating again."
             )
-        # allow_spawn guard
-        wf = load_workflow(project.workspace_dir)
-        allow = bool(
-            wf is not None
-            and wf.coordinator is not None
-            and wf.coordinator.allow_spawn
-        )
-        if not allow:
+        if not _spawn_allowed(project):
             return _err(
                 "spawn_and_rework refused: workflow.coordinator.allow_spawn "
                 "is false.  Use request_rework with an existing agent, or "
@@ -511,6 +559,7 @@ def build_coordinator_tools(project: "Project") -> list[Any]:
 
     return [
         _start_agent,
+        _restart_agent,
         _spawn_agent,
         _mark_done,
         _update_state,

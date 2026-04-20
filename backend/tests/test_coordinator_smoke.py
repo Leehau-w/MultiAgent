@@ -60,6 +60,7 @@ def test_build_server_exposes_expected_tools(project):
         "notify_user",
         "read_context",
         "request_rework",
+        "restart_agent",
         "spawn_agent",
         "spawn_and_rework",
         "start_agent",
@@ -89,8 +90,25 @@ def test_start_agent_tool_rejects_unknown_agent(project):
     assert "No such agent" in result["content"][0]["text"]
 
 
+def _enable_spawn(project: Project) -> None:
+    """Write a minimal workflow.yaml so ``_spawn_allowed`` returns True."""
+    import yaml
+    os.makedirs(project.workspace_dir, exist_ok=True)
+    with open(
+        os.path.join(project.workspace_dir, "workflow.yaml"), "w", encoding="utf-8"
+    ) as f:
+        yaml.safe_dump(
+            {
+                "stages": [{"name": "s", "agents": ["writer"]}],
+                "coordinator": {"enabled": True, "allow_spawn": True},
+            },
+            f,
+        )
+
+
 def test_spawn_agent_tool_creates_and_starts(project):
     _register_agents(project)
+    _enable_spawn(project)
     handlers = _tool_handlers(project)
 
     with patch.object(project, "start_agent") as start:
@@ -108,6 +126,21 @@ def test_spawn_agent_tool_creates_and_starts(project):
     assert "w2" in project.agents
     assert project.agents["w2"].role_id == "writer"
     start.assert_called_once_with("w2", "write a haiku")
+
+
+def test_spawn_agent_tool_refused_when_allow_spawn_false(project):
+    """allow_spawn defaults to false (no workflow.yaml) — spawn must refuse."""
+    _register_agents(project)
+    handlers = _tool_handlers(project)
+
+    result = asyncio.run(
+        handlers["spawn_agent"](
+            {"role_id": "writer", "agent_id": "w2", "prompt": "nope"}
+        )
+    )
+    assert result.get("isError") is True
+    assert "allow_spawn" in result["content"][0]["text"]
+    assert "w2" not in project.agents
 
 
 def test_mark_done_sets_coordinator_completed(project):
@@ -171,11 +204,32 @@ def test_send_user_message_wraps_for_coordinator(project):
     send.assert_awaited_once_with("c1", "[USER_MESSAGE] what's going on?")
 
 
-def test_send_user_message_passes_through_for_workers(project):
+def test_send_user_message_refuses_non_coordinator(project):
+    """Routing a user-channel message to a worker is a bug — workers don't
+    have the [USER_MESSAGE] inbox convention and would treat the wrapped
+    text as a task prompt. Must raise instead of silently dropping.
+    """
     _register_agents(project)
     with patch.object(project, "send_message", new=AsyncMock()) as send:
-        asyncio.run(project.send_user_message("w1", "do a thing"))
-    send.assert_awaited_once_with("w1", "do a thing")
+        with pytest.raises(ValueError, match="not a coordinator"):
+            asyncio.run(project.send_user_message("w1", "do a thing"))
+    send.assert_not_awaited()
+
+
+def test_mark_done_abort_case_insensitive(project):
+    """ABORT: prefix should tolerate case and spacing variants."""
+    from app.project import GateVerdict
+
+    _register_agents(project)
+    handlers = _tool_handlers(project)
+
+    for variant in ("ABORT: real reason", "abort: lowercase", "Abort :spaced", "[ABORT: bracketed"):
+        project.pipeline.current_stage_name = "review"
+        project.pipeline.gate_verdict = None
+        project.pipeline.gate_verdict_ready.clear()
+        asyncio.run(handlers["mark_done"]({"reason": variant}))
+        assert isinstance(project.pipeline.gate_verdict, GateVerdict)
+        assert project.pipeline.gate_verdict.action == "ABORT"
 
 
 # ------------------------------------------------------------------ #

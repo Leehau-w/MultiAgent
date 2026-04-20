@@ -112,6 +112,12 @@ class Budget(BaseModel):
     # [STAGE_RETRY_EXHAUSTED]. ``None`` → let the orchestrator pick a
     # sensible default (currently 3 when stage-gate is active).
     max_stage_retries: int | None = None
+    # Wall-clock ceiling (seconds) on a single stage-gate verdict.  If
+    # the coord hasn't produced a verdict by this deadline the
+    # orchestrator pauses the pipeline with a timeout reason instead of
+    # waiting forever.  ``None`` → no timeout (legacy behaviour).
+    # Default applied at orchestrator level: 600 s.
+    gate_timeout_seconds: int | None = None
 
 
 class Workflow(BaseModel):

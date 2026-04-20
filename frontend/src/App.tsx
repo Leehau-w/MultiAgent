@@ -37,7 +37,10 @@ function App() {
   const [errorsOpen, setErrorsOpen] = useState(false)
   const [coordOpen, setCoordOpen] = useState(false)
 
-  const unresolvedErrorCount = useMemo(
+  // "final" on ErrorInfo means the error exhausted all retries and will
+  // not be retried automatically — the user must intervene. We surface it
+  // as the badge count so the header reflects the actionable workload.
+  const finalErrorCount = useMemo(
     () => errors.filter((e) => e.final).length,
     [errors],
   )
@@ -91,15 +94,15 @@ function App() {
           <button
             onClick={() => setErrorsOpen(true)}
             className={`relative px-3 py-1.5 text-sm border rounded-md transition-colors ${
-              unresolvedErrorCount > 0
+              finalErrorCount > 0
                 ? 'border-rose-700/60 text-rose-300 hover:text-rose-200'
                 : 'border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500'
             }`}
           >
             Errors
-            {unresolvedErrorCount > 0 && (
+            {finalErrorCount > 0 && (
               <span className="ml-2 px-1.5 py-0.5 rounded bg-rose-600/80 text-white text-[10px] font-semibold">
-                {unresolvedErrorCount}
+                {finalErrorCount}
               </span>
             )}
           </button>

@@ -9,7 +9,7 @@ import sys
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from .budget import BudgetExceeded, BudgetTracker
@@ -117,6 +117,12 @@ class PipelineState:
     carries the user's choice (retry the coord invocation, or
     force-advance past the gate) across that handoff.
 
+    ``cancelled`` flips to ``True`` when :meth:`Project.reset_pipeline`
+    retires this state for a fresh run.  Any coroutine still awaiting
+    ``gate_verdict_ready`` / ``resume_ready`` on the old state can
+    inspect the flag after the event fires and bail cleanly instead of
+    consuming stale verdicts meant for the previous run.
+
     Created lazily via :meth:`Project.reset_pipeline` on each
     ``run_pipeline`` invocation so that a second pipeline run does not
     inherit a stale verdict or retry counter.
@@ -135,6 +141,7 @@ class PipelineState:
     pause_reason: str | None = None
     resume_action: Literal["retry", "force_advance"] | None = None
     resume_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    cancelled: bool = False
 
 
 class Project:
@@ -189,6 +196,11 @@ class Project:
         # coordinator's MCP tools (running in a different coroutine task)
         # signal verdicts back to the waiting orchestrator.
         self.pipeline: PipelineState = PipelineState()
+
+        # Watchdog that flags silently-hung agents as STUCK so the coord
+        # (or a human) can restart them. Started lazily on first agent
+        # start so test fixtures that don't run an event loop stay cheap.
+        self._watchdog_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ #
     #  Convenience accessors                                              #
@@ -329,6 +341,7 @@ class Project:
         self.events.clear_completed(agent_id)
         task = asyncio.create_task(self._run_agent(agent_id, prompt, context_from))
         self._tasks[agent_id] = task
+        self._ensure_watchdog()
 
     def stop_agent(self, agent_id: str) -> None:
         """Terminate a running agent, tree-killing its subprocess tree first.
@@ -630,6 +643,111 @@ class Project:
             logger.exception("[%s] os.kill failed for pid %d", self.id, pid)
 
     # ------------------------------------------------------------------ #
+    #  Stuck-agent watchdog                                               #
+    # ------------------------------------------------------------------ #
+
+    # Wall-clock without any stream activity before the watchdog flips a
+    # running agent into ``STUCK``. The CLI's own Bash timeout is 5 min
+    # so genuine long-running tools should never trip this; we leave a
+    # comfortable margin for slow tool_results (large Reads, rg over a
+    # big repo) without making hangs invisible for too long.
+    WATCHDOG_STUCK_SECONDS = 480  # 8 min
+    WATCHDOG_INTERVAL_SECONDS = 30
+
+    def _ensure_watchdog(self) -> None:
+        """Start the watchdog background task if it isn't already running.
+        Lazy so projects instantiated outside an event loop (tests, migrations)
+        don't eagerly spawn tasks."""
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop yet — next start_agent will try again
+        self._watchdog_task = loop.create_task(
+            self._watchdog_loop(), name=f"watchdog-{self.id}",
+        )
+
+    async def _watchdog_loop(self) -> None:
+        """Scan running agents periodically, flag silent ones as STUCK.
+
+        The flag is advisory — we do NOT auto-kill. The coord (or the user)
+        decides whether to restart. A stuck agent that resumes producing
+        output transitions back to RUNNING automatically in
+        :meth:`_handle_provider_message`.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.WATCHDOG_INTERVAL_SECONDS)
+                try:
+                    await self._scan_for_stuck()
+                except Exception:  # noqa: BLE001
+                    logger.exception("[%s] watchdog scan failed", self.id)
+        except asyncio.CancelledError:
+            pass
+
+    async def _scan_for_stuck(self) -> None:
+        now = datetime.now()
+        threshold = timedelta(seconds=self.WATCHDOG_STUCK_SECONDS)
+        for agent_id, agent in list(self.agents.items()):
+            if agent.status != AgentStatus.RUNNING:
+                continue
+            last = agent.last_activity_at or agent.started_at
+            if last is None:
+                continue
+            if now - last < threshold:
+                continue
+            agent.status = AgentStatus.STUCK
+            idle_min = (now - last).total_seconds() / 60.0
+            logger.warning(
+                "[%s] agent %s stuck — no stream activity for %.1fm",
+                self.id, agent_id, idle_min,
+            )
+            self._log_entry(
+                agent_id,
+                OutputEntry(
+                    type="error",
+                    content=(
+                        f"Watchdog: no stream activity for {idle_min:.1f}m "
+                        f"(threshold {self.WATCHDOG_STUCK_SECONDS // 60}m). "
+                        "Coordinator can restart via mcp__coord__restart_agent."
+                    ),
+                ),
+            )
+            await self._emit_status(agent_id)
+            await self._emit(agent_id, "agent_stuck", {
+                "idle_minutes": round(idle_min, 1),
+                "last_activity_at": last.isoformat(),
+            })
+            self.events.push(Event(
+                kind="agent_stuck",
+                agent=agent_id,
+                detail={"idle_minutes": round(idle_min, 1)},
+            ))
+            # Wake the coordinator so it can decide — stage-gate runs
+            # normally suppress per-worker notifications in favour of
+            # stage summaries, but a silently wedged worker is exactly
+            # the case where the stage will NEVER summarise without
+            # intervention. Bypass the suppression here.
+            coord_id = self._find_coordinator(self._coord_role_id())
+            if coord_id and coord_id != agent_id:
+                try:
+                    await self.send_message(
+                        coord_id,
+                        f"[AGENT_STUCK] agent={agent_id} "
+                        f"idle={idle_min:.1f}m — no stream activity since "
+                        f"{last.isoformat()}. Use "
+                        f"`restart_agent(agent_id, prompt)` to force-stop "
+                        f"and re-run, or `mark_done(\"ABORT: <reason>\")` "
+                        f"if the stage cannot recover.",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[%s] failed to notify coord of stuck agent %s",
+                        self.id, agent_id,
+                    )
+
+    # ------------------------------------------------------------------ #
     #  Agent finalization                                                 #
     # ------------------------------------------------------------------ #
 
@@ -716,7 +834,17 @@ class Project:
         Called at the top of each :meth:`orchestrator.run_pipeline` invocation
         so a second run does not inherit a stale ``gate_verdict`` or
         ``stage_retries`` counter from the previous run.
+
+        Any previous pipeline is marked ``cancelled`` and its pending
+        events fired so stray coroutines still awaiting ``gate_verdict_ready``
+        / ``resume_ready`` wake up and can bail instead of silently
+        holding the old Event reference forever.
         """
+        old = getattr(self, "pipeline", None)
+        if old is not None:
+            old.cancelled = True
+            old.gate_verdict_ready.set()
+            old.resume_ready.set()
         self.pipeline = PipelineState()
         return self.pipeline
 
@@ -1015,15 +1143,23 @@ class Project:
 
     async def send_user_message(self, agent_id: str, content: str) -> None:
         """Deliver a message from the user.  Wraps it as ``[USER_MESSAGE] <text>``
-        when the target is the coordinator so its system-prompt routing logic
-        handles it as a dialog event (not as a new agent-run instruction).
-        Non-coord agents receive the raw text — workers don't have inbox
-        conventions.
+        so the coordinator's system-prompt routing logic handles it as a
+        dialog event (not as a new agent-run instruction).
+
+        Refuses to deliver to non-coordinator agents — workers don't have
+        the ``[USER_MESSAGE]`` inbox convention and would interpret the
+        wrapped text as a task prompt.  Callers (API layer, ChatPanel)
+        should route user-originated chat to the coord, or fall back to
+        the plain :meth:`send_message` when messaging a worker directly.
         """
         agent = self.get_agent(agent_id)
-        if agent.role_id == self._coord_role_id():
-            content = f"[USER_MESSAGE] {content}"
-        await self.send_message(agent_id, content)
+        if agent.role_id != self._coord_role_id():
+            raise ValueError(
+                f"agent {agent_id!r} is not a coordinator — "
+                f"user messages can only be routed to the coord role "
+                f"({self._coord_role_id()})"
+            )
+        await self.send_message(agent_id, f"[USER_MESSAGE] {content}")
 
     # ------------------------------------------------------------------ #
     #  Workflow triggers                                                   #
@@ -1124,6 +1260,7 @@ class Project:
             while True:
                 agent.status = AgentStatus.RUNNING
                 agent.started_at = datetime.now()
+                agent.last_activity_at = agent.started_at
                 agent.finished_at = None   # clear stale mark from prior turn
                 agent.current_task = current_prompt[:200]
                 agent.usage = AgentUsage()
@@ -1382,6 +1519,16 @@ class Project:
         self, agent_id: str, model: str, msg: ProviderMessage
     ) -> None:
         agent = self.agents[agent_id]
+
+        # Every provider message counts as activity — the watchdog uses
+        # this to decide whether a "running" agent is actually making
+        # progress or silently hung on a lost tool_result.
+        agent.last_activity_at = datetime.now()
+        if agent.status == AgentStatus.STUCK:
+            # Agent woke up on its own (rare — most stuck agents need
+            # tree-kill). Clear the flag so the UI stops flashing red.
+            agent.status = AgentStatus.RUNNING
+            await self._emit_status(agent_id)
 
         if msg.type == "usage":
             agent.usage.input_tokens = msg.usage.get("input_tokens", agent.usage.input_tokens)

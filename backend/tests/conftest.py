@@ -51,6 +51,7 @@ class FakeAdapter(ProviderAdapter):
         effort: str | None = None,
         permission_callback=None,
         mcp_servers=None,
+        pid_callback=None,
     ) -> AsyncIterator[ProviderMessage]:
         self.runs.append({
             "prompt": prompt,

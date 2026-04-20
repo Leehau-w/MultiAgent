@@ -36,6 +36,9 @@ interface AgentStore {
   workflow: Workflow | null
   notifications: CoordinatorNotification[]
   decisions: CoordinatorDecision[]
+  /** Active workspace path; changes on /api/project PUT. Used as a cache key
+   *  so project-scoped effects (notifications replay) re-fire on switch. */
+  currentProjectPath: string
 
   setRoles: (roles: Record<string, AgentRole>) => void
   setAgents: (agents: Record<string, AgentState>) => void
@@ -47,6 +50,7 @@ interface AgentStore {
   setAgentPermissionMode: (agentId: string, mode: PermissionMode | null) => void
   setWorkflow: (workflow: Workflow | null) => void
   refreshWorkflow: () => Promise<void>
+  setCurrentProjectPath: (path: string) => void
   handleWSEvent: (event: WSEvent) => void
 
   // Notifications
@@ -78,6 +82,9 @@ export const useAgentStore = create<AgentStore>((set) => ({
   workflow: null,
   notifications: [],
   decisions: [],
+  currentProjectPath: '',
+
+  setCurrentProjectPath: (path) => set({ currentProjectPath: path }),
 
   seedNotifications: (items) =>
     set((state) => {
