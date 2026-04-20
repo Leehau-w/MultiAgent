@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAgentStore } from './stores/agentStore'
 import { useWebSocket } from './hooks/useWebSocket'
+import BudgetBar from './components/BudgetBar'
+import CoordinatorPanel from './components/CoordinatorPanel'
 import Dashboard from './components/Dashboard'
 import OutputStream from './components/OutputStream'
 import ChatPanel from './components/ChatPanel'
 import ContextViewer from './components/ContextViewer'
 import ErrorPanel from './components/ErrorPanel'
+import NotificationsContainer from './components/Notifications'
 import PermissionPanel from './components/PermissionPanel'
+import PipelineBanner from './components/PipelineBanner'
 import PipelineModal from './components/PipelineModal'
 import PipelineProgress from './components/PipelineProgress'
 import ProjectSelector from './components/ProjectSelector'
 import RolesEditor from './components/RolesEditor'
 import ToastContainer from './components/Toast'
+import WorkflowEditor from './components/WorkflowEditor'
+import WorkflowGraph from './components/WorkflowGraph'
 import type { WSEvent } from './types'
 
 function App() {
@@ -22,10 +28,14 @@ function App() {
     setErrors,
     handleWSEvent,
     errors,
+    workflow,
+    refreshWorkflow,
   } = useAgentStore()
   const [pipelineOpen, setPipelineOpen] = useState(false)
   const [rolesOpen, setRolesOpen] = useState(false)
+  const [workflowOpen, setWorkflowOpen] = useState(false)
   const [errorsOpen, setErrorsOpen] = useState(false)
+  const [coordOpen, setCoordOpen] = useState(false)
 
   const unresolvedErrorCount = useMemo(
     () => errors.filter((e) => e.final).length,
@@ -63,7 +73,9 @@ function App() {
         if (Array.isArray(d.errors)) setErrors(d.errors)
       })
       .catch(console.error)
-  }, [setRoles, setAgents, setGlobalPermissionMode, setErrors])
+
+    refreshWorkflow()
+  }, [setRoles, setAgents, setGlobalPermissionMode, setErrors, refreshWorkflow])
 
   return (
     <div className="h-screen flex flex-col bg-gray-950 text-gray-200">
@@ -98,6 +110,12 @@ function App() {
             Roles
           </button>
           <button
+            onClick={() => setWorkflowOpen(true)}
+            className="px-3 py-1.5 text-gray-400 hover:text-gray-200 text-sm border border-gray-700 hover:border-gray-500 rounded-md transition-colors"
+          >
+            Workflow
+          </button>
+          <button
             onClick={() => setPipelineOpen(true)}
             className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors"
           >
@@ -106,11 +124,21 @@ function App() {
         </div>
       </header>
 
+      {/* Pause / abort banner — only visible when the pipeline stalls */}
+      <PipelineBanner />
+
+      {/* Budget usage bar (hidden when no caps configured) */}
+      <BudgetBar />
+
       {/* Pipeline progress bar */}
       <PipelineProgress />
 
-      {/* Agent cards */}
-      <Dashboard />
+      {/* Agent cards — workflow topology when workflow.yaml exists, flat roster otherwise */}
+      {workflow && workflow.stages.length > 0 ? (
+        <WorkflowGraph workflow={workflow} />
+      ) : (
+        <Dashboard />
+      )}
 
       {/* Main content area */}
       <div className="flex-1 flex min-h-0 border-t border-gray-800">
@@ -130,12 +158,32 @@ function App() {
       {/* Modals */}
       <PipelineModal open={pipelineOpen} onClose={() => setPipelineOpen(false)} />
       <RolesEditor open={rolesOpen} onClose={() => setRolesOpen(false)} />
+      <WorkflowEditor open={workflowOpen} onClose={() => setWorkflowOpen(false)} />
       <ErrorPanel open={errorsOpen} onClose={() => setErrorsOpen(false)} />
+      <CoordinatorPanel open={coordOpen} onClose={() => setCoordOpen(false)} />
 
-      {/* Toast notifications */}
+      {/* Toasts — generic (existing) + coordinator notifications (v0.3.0) */}
       <ToastContainer />
+      <NotificationsContainer />
+
+      {/* Window-global hook so AgentCard (and any other caller) can open
+          the coord panel without threading props.  Side-effect wrapper in
+          CoordinatorLauncher — rendered once per App mount. */}
+      <CoordinatorLauncher onOpen={() => setCoordOpen(true)} />
     </div>
   )
+}
+
+function CoordinatorLauncher({ onOpen }: { onOpen: () => void }) {
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(window as any).__openCoordinatorPanel = onOpen
+    return () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      delete (window as any).__openCoordinatorPanel
+    }
+  }, [onOpen])
+  return null
 }
 
 export default App

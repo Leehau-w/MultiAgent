@@ -80,6 +80,17 @@ reviewer:
 - **Usage tracking** — token counts and cost per agent
 - **Session resume** — continue conversations with agents
 
+### New in v0.2.0
+
+- **Declarative workflows** — `workflow.yaml` per project with stages, budget, triggers, coordinator config; UI editor under the **Workflow** button. See [workflow guide](./docs/workflow-guide.md).
+- **Budget enforcement** — cap cost / turns / wall-clock / concurrency per project; visible in a header bar that trips amber at 70%, red at 90%.
+- **Event-driven triggers** — one agent's completion can fan out in parallel, AND-join into a reviewer, or hand off to a coordinator.
+- **Stateless coordinator** — a `coordinator` role with 4-block externalized memory (`facts` / `hypothesis` / `open_questions` / `decisions`) at `coordinator_state.yaml`, re-invoked fresh per event.
+- **Error resilience** — errors classified into tool/api/auth/sdk; transient errors retry with backoff, fatal errors halt the agent; full error log at `workspace/{project}/errors.jsonl`.
+- **Multi-project isolation** — open multiple projects in separate tabs; each has its own agents, budget, permission mode, context.
+- **Persistence** — agent metadata and a 500-entry rolling output window survive backend restarts.
+- **Context compaction** — manual Compact button archives the current MD to `.history/` and replaces it with a Haiku-summarised version.
+
 ---
 
 ## Architecture

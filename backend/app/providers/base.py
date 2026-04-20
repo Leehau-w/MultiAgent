@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Awaitable, Callable, Literal
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 
 @dataclass
@@ -35,8 +35,22 @@ class ProviderAdapter(ABC):
         session_id: str | None = None,
         effort: str | None = None,
         permission_callback: Callable[[str, dict], Awaitable[bool]] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
+        pid_callback: Callable[[int, int | None], None] | None = None,
     ) -> AsyncIterator[ProviderMessage]:
         """Execute an agentic loop, yielding ProviderMessages as work happens.
+
+        ``mcp_servers`` maps server name → provider-specific server config.
+        Adapters that support in-process MCP (currently only Claude) wire
+        these through to the underlying SDK; others safely ignore the
+        parameter.
+
+        ``pid_callback`` (Claude only) is invoked with ``(pid, job_handle)``
+        where ``pid`` is the spawned ``claude.exe`` PID and ``job_handle``
+        is a Windows Job Object handle (``int``) or ``None``. The handle
+        lets the orchestrator kill the whole process tree — including
+        detached descendants — via ``TerminateJobObject``. Non-Claude
+        adapters ignore it.
 
         Must yield at least one message with type="result" at the end.
         """

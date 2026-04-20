@@ -81,4 +81,9 @@ def tool_needs_approval(tool_name: str, tool_input: dict) -> bool:
         return False
     if tool_name == "Bash":
         return not is_readonly_bash(tool_input.get("command", ""))
+    # The coordinator's in-process tools (start_agent / spawn_agent /
+    # mark_done) are dispatched by our own runtime — approving them would
+    # just be the user confirming their own decision.
+    if tool_name.startswith("mcp__coord__"):
+        return False
     return True

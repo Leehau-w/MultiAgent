@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentState, AgentRole, AgentStatus, ErrorInfo, OutputEntry, PermissionMode, PermissionRequest, WSEvent } from '../types'
+import type { AgentState, AgentRole, AgentStatus, CoordinatorDecision, CoordinatorNotification, ErrorInfo, OutputEntry, PermissionMode, PermissionRequest, Workflow, WSEvent } from '../types'
 
 export interface PipelineStage {
   name: string
@@ -8,10 +8,19 @@ export interface PipelineStage {
 }
 
 export interface PipelineState {
-  status: 'idle' | 'running' | 'completed'
+  // v0.3.0: 'paused' and 'failed' join 'idle' | 'running' | 'completed' | 'error'.
+  status: 'idle' | 'running' | 'completed' | 'error' | 'paused' | 'failed'
   requirement: string
   stages: PipelineStage[]
   currentStage: number
+  /** Stage currently under gate review (coord deciding APPROVE/RETRY/ABORT). */
+  stageReviewing: string | null
+  /** Retry counter per stage name; absent/0 ⇒ no rework cycles yet. */
+  stageRetries: Record<string, number>
+  /** Non-null when the pipeline is paused waiting for user action. */
+  pauseReason: string | null
+  /** Terminal failure reason surfaced via pipeline_status:failed. */
+  failureReason: string | null
 }
 
 interface AgentStore {
@@ -24,15 +33,36 @@ interface AgentStore {
   pipeline: PipelineState
   permissionQueue: PermissionRequest[]
   globalPermissionMode: PermissionMode
+  workflow: Workflow | null
+  notifications: CoordinatorNotification[]
+  decisions: CoordinatorDecision[]
 
   setRoles: (roles: Record<string, AgentRole>) => void
   setAgents: (agents: Record<string, AgentState>) => void
+  clearAgents: () => void
   setErrors: (errors: ErrorInfo[]) => void
   clearErrors: () => void
   selectAgent: (id: string | null) => void
   setGlobalPermissionMode: (mode: PermissionMode) => void
   setAgentPermissionMode: (agentId: string, mode: PermissionMode | null) => void
+  setWorkflow: (workflow: Workflow | null) => void
+  refreshWorkflow: () => Promise<void>
   handleWSEvent: (event: WSEvent) => void
+
+  // Notifications
+  seedNotifications: (items: CoordinatorNotification[]) => void
+  dismissNotification: (id: string) => void
+}
+
+const EMPTY_PIPELINE: PipelineState = {
+  status: 'idle',
+  requirement: '',
+  stages: [],
+  currentStage: 0,
+  stageReviewing: null,
+  stageRetries: {},
+  pauseReason: null,
+  failureReason: null,
 }
 
 export const useAgentStore = create<AgentStore>((set) => ({
@@ -42,11 +72,52 @@ export const useAgentStore = create<AgentStore>((set) => ({
   contextCache: {},
   outputStreams: {},
   errors: [],
-  pipeline: { status: 'idle', requirement: '', stages: [], currentStage: 0 },
+  pipeline: { ...EMPTY_PIPELINE },
   permissionQueue: [],
   globalPermissionMode: 'manual',
+  workflow: null,
+  notifications: [],
+  decisions: [],
+
+  seedNotifications: (items) =>
+    set((state) => {
+      // Preserve any dismissal state already carried in current store —
+      // the /notifications endpoint doesn't know what the user clicked away.
+      const dismissedIds = new Set(
+        state.notifications.filter((n) => n.dismissed).map((n) => n.id),
+      )
+      return {
+        notifications: items.map((n) => ({
+          ...n,
+          dismissed: dismissedIds.has(n.id),
+        })),
+      }
+    }),
+
+  dismissNotification: (id) =>
+    set((state) => ({
+      notifications: state.notifications.map((n) =>
+        n.id === id ? { ...n, dismissed: true } : n,
+      ),
+    })),
 
   setRoles: (roles) => set({ roles }),
+
+  setWorkflow: (workflow) => set({ workflow }),
+
+  refreshWorkflow: async () => {
+    try {
+      const res = await fetch('/api/workflow')
+      if (!res.ok) {
+        set({ workflow: null })
+        return
+      }
+      const d = await res.json()
+      set({ workflow: d.exists && d.workflow ? (d.workflow as Workflow) : null })
+    } catch {
+      set({ workflow: null })
+    }
+  },
 
   setErrors: (errors) => set({ errors }),
 
@@ -81,6 +152,15 @@ export const useAgentStore = create<AgentStore>((set) => ({
         if (!(id in agents)) delete streams[id]
       }
       return { agents, outputStreams: streams }
+    }),
+
+  clearAgents: () =>
+    set({
+      agents: {},
+      outputStreams: {},
+      contextCache: {},
+      permissionQueue: [],
+      selectedAgentId: null,
     }),
 
   selectAgent: (id) => set({ selectedAgentId: id }),
@@ -136,14 +216,118 @@ export const useAgentStore = create<AgentStore>((set) => ({
 
       // Pipeline-level events (no agent_id)
       if (type === 'pipeline_status') {
+        const nextStatus =
+          (data.status as PipelineState['status']) || state.pipeline.status
+        // failed/completed/error exit a paused hold, so clear pause+review markers.
+        const isTerminal =
+          nextStatus === 'completed' ||
+          nextStatus === 'failed' ||
+          nextStatus === 'error'
         return {
           pipeline: {
             ...state.pipeline,
-            status: (data.status as PipelineState['status']) || state.pipeline.status,
-            requirement: (data.requirement as string) ?? state.pipeline.requirement,
+            status: nextStatus,
+            requirement:
+              (data.requirement as string) ?? state.pipeline.requirement,
             stages: (data.stages as PipelineStage[]) ?? state.pipeline.stages,
-            currentStage: (data.current_stage as number) ?? state.pipeline.currentStage,
+            currentStage:
+              (data.current_stage as number) ?? state.pipeline.currentStage,
+            pauseReason: isTerminal ? null : state.pipeline.pauseReason,
+            stageReviewing: isTerminal ? null : state.pipeline.stageReviewing,
+            failureReason:
+              nextStatus === 'failed'
+                ? (data.reason as string) || state.pipeline.failureReason
+                : null,
           },
+        }
+      }
+
+      if (type === 'stage_gate_review_started') {
+        return {
+          pipeline: {
+            ...state.pipeline,
+            stageReviewing: (data.stage_name as string) || null,
+          },
+        }
+      }
+
+      if (type === 'stage_gate_resolved') {
+        const verdict = (data.verdict as string) || ''
+        const stageName = (data.stage_name as string) || ''
+        // RETRY bumps the per-stage retry counter; APPROVE clears the review
+        // marker but leaves the counter (frontend still shows 2/3 on the
+        // stage badge until the next stage advances).
+        const retries = { ...state.pipeline.stageRetries }
+        if (verdict === 'RETRY' && stageName) {
+          retries[stageName] = (retries[stageName] || 0) + 1
+        }
+        return {
+          pipeline: {
+            ...state.pipeline,
+            stageReviewing: null,
+            stageRetries: retries,
+          },
+        }
+      }
+
+      if (type === 'pipeline_paused') {
+        return {
+          pipeline: {
+            ...state.pipeline,
+            status: 'paused',
+            pauseReason:
+              (data.reason as string) ||
+              state.pipeline.pauseReason ||
+              'Pipeline paused',
+          },
+        }
+      }
+
+      if (type === 'pipeline_resumed') {
+        return {
+          pipeline: {
+            ...state.pipeline,
+            status: 'running',
+            pauseReason: null,
+          },
+        }
+      }
+
+      if (type === 'coordinator_notify_user') {
+        const id = (data.id as string) || ''
+        if (!id) return state
+        // Dedupe by id — the event can race the /notifications replay GET
+        // when a browser tab opens mid-broadcast.
+        if (state.notifications.some((n) => n.id === id)) return state
+        const level = (data.level as CoordinatorNotification['level']) || 'info'
+        return {
+          notifications: [
+            ...state.notifications,
+            {
+              id,
+              level,
+              message: (data.message as string) || '',
+              action_required: Boolean(data.action_required),
+              timestamp:
+                (data.timestamp as string) || new Date().toISOString(),
+              dismissed: false,
+            },
+          ],
+        }
+      }
+
+      if (type === 'coordinator_decision') {
+        const scope = (data.scope as CoordinatorDecision['scope']) || 'coordinator'
+        return {
+          decisions: [
+            ...state.decisions,
+            {
+              scope,
+              decision: (data.decision as string) || '',
+              rationale: (data.rationale as string) || '',
+              timestamp: new Date().toISOString(),
+            },
+          ].slice(-200),
         }
       }
 

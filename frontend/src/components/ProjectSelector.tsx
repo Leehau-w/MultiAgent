@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { apiFetch, apiPut } from '../utils/api'
+import { useAgentStore } from '../stores/agentStore'
 import { useToastStore } from '../stores/toastStore'
 
 export default function ProjectSelector() {
@@ -40,6 +41,7 @@ export default function ProjectSelector() {
       setRecent(d.recent || [])
       setOpen(false)
       setInputValue('')
+      useAgentStore.getState().refreshWorkflow()
       useToastStore.getState().add('success', `Switched to ${d.path}`)
     }
   }

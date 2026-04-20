@@ -18,8 +18,17 @@ from .models import (
     StartAgentRequest,
     StartPipelineRequest,
 )
+from .budget import BudgetExceeded
+from .compaction import compact_context, list_history, read_history
 from .orchestrator import Orchestrator
 from .project import Project
+from .workflow import (
+    Workflow,
+    delete_workflow,
+    load_workflow,
+    save_workflow,
+    workflow_path,
+)
 from .ws_manager import WSManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -300,10 +309,38 @@ async def delete_agent_scoped(project_id: str, agent_id: str):
     return _delete_agent(_project_or_404(project_id), agent_id)
 
 
+def _clear_agents(project: Project) -> dict:
+    """Stop + delete every agent in *project*. Returns the ids removed so
+    the caller can reconcile UI state. Safe to call when the project is
+    empty — returns an empty list."""
+    ids = list(project.agents.keys())
+    removed: list[str] = []
+    for aid in ids:
+        try:
+            project.delete_agent(aid)
+            removed.append(aid)
+        except ValueError:
+            # Already gone between list() and delete — fine.
+            continue
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/agents")
+async def clear_agents_legacy():
+    return _clear_agents(_project_or_404())
+
+
+@app.delete("/api/projects/{project_id}/agents")
+async def clear_agents_scoped(project_id: str):
+    return _clear_agents(_project_or_404(project_id))
+
+
 def _start_agent(project: Project, agent_id: str, req: StartAgentRequest) -> dict:
     try:
         project.start_agent(agent_id, req.prompt, req.context_from)
         return {"ok": True, "agentId": agent_id}
+    except BudgetExceeded as e:
+        raise HTTPException(429, f"Budget exceeded ({e.reason}): {e.detail}")
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -320,7 +357,7 @@ async def start_agent_scoped(project_id: str, agent_id: str, req: StartAgentRequ
 
 async def _send_message(project: Project, agent_id: str, req: SendMessageRequest) -> dict:
     try:
-        await project.send_message(agent_id, req.content)
+        await project.send_user_message(agent_id, req.content)
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -360,6 +397,60 @@ async def get_agent_context_scoped(project_id: str, agent_id: str):
     return {"agentId": agent_id, "content": project.ctx.read(agent_id)}
 
 
+async def _compact_impl(project: Project, agent_id: str) -> dict:
+    if agent_id not in project.agents:
+        raise HTTPException(404, f"No such agent: {agent_id}")
+    try:
+        result = await compact_context(project.ctx, agent_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No context file for {agent_id}")
+    return {"ok": True, "agentId": agent_id, **result}
+
+
+@app.post("/api/agents/{agent_id}/compact")
+async def compact_agent_legacy(agent_id: str):
+    return await _compact_impl(_project_or_404(), agent_id)
+
+
+@app.post("/api/projects/{project_id}/agents/{agent_id}/compact")
+async def compact_agent_scoped(project_id: str, agent_id: str):
+    return await _compact_impl(_project_or_404(project_id), agent_id)
+
+
+def _history_list_payload(project: Project, agent_id: str) -> dict:
+    return {"agentId": agent_id, "entries": list_history(project.ctx, agent_id)}
+
+
+@app.get("/api/agents/{agent_id}/history")
+async def list_history_legacy(agent_id: str):
+    return _history_list_payload(_project_or_404(), agent_id)
+
+
+@app.get("/api/projects/{project_id}/agents/{agent_id}/history")
+async def list_history_scoped(project_id: str, agent_id: str):
+    return _history_list_payload(_project_or_404(project_id), agent_id)
+
+
+def _history_read_payload(project: Project, agent_id: str, filename: str) -> dict:
+    try:
+        content = read_history(project.ctx, agent_id, filename)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No such archive: {filename}")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"agentId": agent_id, "filename": filename, "content": content}
+
+
+@app.get("/api/agents/{agent_id}/history/{filename}")
+async def read_history_legacy(agent_id: str, filename: str):
+    return _history_read_payload(_project_or_404(), agent_id, filename)
+
+
+@app.get("/api/projects/{project_id}/agents/{agent_id}/history/{filename}")
+async def read_history_scoped(project_id: str, agent_id: str, filename: str):
+    return _history_read_payload(_project_or_404(project_id), agent_id, filename)
+
+
 def _stream_payload(project: Project, agent_id: str, limit: int) -> dict:
     entries = project.streams.tail(agent_id, limit=limit)
     return {
@@ -382,6 +473,64 @@ async def get_agent_stream(project_id: str, agent_id: str, limit: int = 500):
     startup, but the on-disk stream retains the last 500 entries.
     """
     return _stream_payload(_project_or_404(project_id), agent_id, limit)
+
+
+# ------------------------------------------------------------------ #
+#  Coordinator state                                                  #
+# ------------------------------------------------------------------ #
+
+
+def _coordinator_state_payload(project: Project) -> dict:
+    path = project.coordinator_state_path
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        exists = True
+    except FileNotFoundError:
+        content = ""
+        exists = False
+    return {"path": path, "exists": exists, "content": content}
+
+
+@app.get("/api/coordinator_state")
+async def get_coordinator_state_legacy():
+    return _coordinator_state_payload(_project_or_404())
+
+
+@app.get("/api/projects/{project_id}/coordinator_state")
+async def get_coordinator_state_scoped(project_id: str):
+    return _coordinator_state_payload(_project_or_404(project_id))
+
+
+def _coordinator_state_structured_payload(project: Project) -> dict:
+    """Parsed YAML view of the coordinator's structured state.
+
+    Tracks four blocks — facts, hypothesis, open_questions, decisions — per
+    ``coordinator_state.py``. The raw MD scratchpad is at
+    ``/coordinator_state`` (above); this endpoint is for the State tab of
+    the frontend CoordinatorPanel.
+    """
+    from .coordinator_state import load_state, state_path
+
+    state = load_state(project.workspace_dir)
+    return {
+        "path": state_path(project.workspace_dir),
+        "version": state.version,
+        "facts": [f.model_dump(mode="json") for f in state.facts],
+        "hypothesis": state.hypothesis,
+        "open_questions": list(state.open_questions),
+        "decisions": [d.model_dump(mode="json") for d in state.decisions],
+    }
+
+
+@app.get("/api/coordinator_state/structured")
+async def get_coordinator_state_structured_legacy():
+    return _coordinator_state_structured_payload(_project_or_404())
+
+
+@app.get("/api/projects/{project_id}/coordinator_state/structured")
+async def get_coordinator_state_structured_scoped(project_id: str):
+    return _coordinator_state_structured_payload(_project_or_404(project_id))
 
 
 # ------------------------------------------------------------------ #
@@ -515,6 +664,269 @@ async def start_pipeline_scoped(project_id: str, req: StartPipelineRequest):
     import asyncio
     asyncio.create_task(orchestrator.run_pipeline(project_id, req.requirement, req.stages))
     return {"ok": True, "message": "Pipeline started"}
+
+
+async def _resume_impl(project: Project, body: dict) -> dict:
+    action = str(body.get("action") or "").strip()
+    try:
+        return await orchestrator.resume_pipeline(project.id, action)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/pipeline/resume")
+async def resume_pipeline_legacy(body: dict):
+    return await _resume_impl(_project_or_404(), body)
+
+
+@app.post("/api/projects/{project_id}/pipeline/resume")
+async def resume_pipeline_scoped(project_id: str, body: dict):
+    return await _resume_impl(_project_or_404(project_id), body)
+
+
+async def _approve_impl(project: Project, body: dict) -> dict:
+    """User-initiated force-approve of the currently reviewed stage.
+
+    Used by the frontend's "Override & continue" button on a blocker
+    notification and by manual "skip gate" UI actions. Records the decision
+    as a ``coordinator_decision`` WS event so the decisions log surfaces the
+    user override.
+    """
+    summary = str(body.get("summary") or "").strip()
+    try:
+        return await orchestrator.approve_stage_from_user(project.id, summary)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/pipeline/approve")
+async def approve_pipeline_legacy(body: dict):
+    return await _approve_impl(_project_or_404(), body)
+
+
+@app.post("/api/projects/{project_id}/pipeline/approve")
+async def approve_pipeline_scoped(project_id: str, body: dict):
+    return await _approve_impl(_project_or_404(project_id), body)
+
+
+# ------------------------------------------------------------------ #
+#  Notifications (Track B)                                            #
+# ------------------------------------------------------------------ #
+
+
+def _parse_since(raw: str | None):
+    """Parse an ISO-8601 ``since`` query string into an aware datetime.
+
+    Accepts the common ``...Z`` suffix as well as explicit ``+00:00``.  On
+    empty or malformed input returns ``None`` — callers treat that as "no
+    filter" rather than error-ing out the request (a stale client clock
+    shouldn't break replay).
+    """
+    from datetime import datetime, timezone
+
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _list_notifications(project: Project, since: str | None, limit: int) -> dict:
+    from .notifications import read_notifications
+
+    items = read_notifications(
+        project.workspace_dir,
+        since=_parse_since(since),
+        limit=max(1, min(limit, 500)),
+    )
+    return {
+        "notifications": [
+            {
+                "id": e.id,
+                "level": e.level,
+                "message": e.message,
+                "action_required": e.action_required,
+                "timestamp": e.ts.isoformat(),
+            }
+            for e in items
+        ]
+    }
+
+
+@app.get("/api/notifications")
+async def list_notifications_legacy(since: str | None = None, limit: int = 100):
+    return await _list_notifications(_project_or_404(), since, limit)
+
+
+@app.get("/api/projects/{project_id}/notifications")
+async def list_notifications_scoped(
+    project_id: str, since: str | None = None, limit: int = 100,
+):
+    return await _list_notifications(_project_or_404(project_id), since, limit)
+
+
+# ------------------------------------------------------------------ #
+#  Workflow (declarative pipeline)                                    #
+# ------------------------------------------------------------------ #
+
+
+def _workflow_payload(project: Project) -> dict:
+    path = workflow_path(project.workspace_dir)
+    wf = load_workflow(project.workspace_dir)
+    if wf is None:
+        return {"path": path, "exists": False, "workflow": None}
+    return {"path": path, "exists": True, "workflow": wf.model_dump()}
+
+
+def _save_workflow_from_body(project: Project, body: dict) -> dict:
+    try:
+        wf = Workflow(**body)
+    except Exception as exc:  # noqa: BLE001 — pydantic + ad-hoc input
+        raise HTTPException(400, f"Invalid workflow: {exc}")
+    path = save_workflow(project.workspace_dir, wf)
+    return {"ok": True, "path": path, "workflow": wf.model_dump()}
+
+
+@app.get("/api/workflow")
+async def get_workflow_legacy():
+    return _workflow_payload(_project_or_404())
+
+
+@app.get("/api/projects/{project_id}/workflow")
+async def get_workflow_scoped(project_id: str):
+    return _workflow_payload(_project_or_404(project_id))
+
+
+@app.put("/api/workflow")
+async def put_workflow_legacy(body: dict):
+    return _save_workflow_from_body(_project_or_404(), body)
+
+
+@app.put("/api/projects/{project_id}/workflow")
+async def put_workflow_scoped(project_id: str, body: dict):
+    return _save_workflow_from_body(_project_or_404(project_id), body)
+
+
+@app.delete("/api/workflow")
+async def delete_workflow_legacy():
+    deleted = delete_workflow(_project_or_404().workspace_dir)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.delete("/api/projects/{project_id}/workflow")
+async def delete_workflow_scoped(project_id: str):
+    deleted = delete_workflow(_project_or_404(project_id).workspace_dir)
+    return {"ok": True, "deleted": deleted}
+
+
+# Raw YAML access for the WorkflowEditor UI. We keep this separate from
+# the structured GET/PUT above so the editor can round-trip comments and
+# key ordering that Pydantic's model_dump would flatten away.
+
+
+def _workflow_raw_payload(project: Project) -> dict:
+    path = workflow_path(project.workspace_dir)
+    if not os.path.isfile(path):
+        return {"path": path, "exists": False, "content": ""}
+    with open(path, "r", encoding="utf-8") as f:
+        return {"path": path, "exists": True, "content": f.read()}
+
+
+def _save_workflow_from_raw(project: Project, body: dict) -> dict:
+    import yaml as _yaml  # local import — rarely used
+
+    content = str(body.get("content") or "")
+    if not content.strip():
+        raise HTTPException(400, "workflow YAML content is empty")
+    try:
+        parsed = _yaml.safe_load(content)
+    except _yaml.YAMLError as exc:
+        raise HTTPException(400, f"YAML parse error: {exc}")
+    if not isinstance(parsed, dict):
+        raise HTTPException(400, "workflow YAML must be a mapping at the top level")
+    try:
+        wf = Workflow(**parsed)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"Invalid workflow: {exc}")
+    # Persist the user's raw text (preserves comments + ordering) then
+    # round-trip once through the validator path so we know the loader
+    # will accept it on next startup.
+    os.makedirs(project.workspace_dir, exist_ok=True)
+    path = workflow_path(project.workspace_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+    # Sanity-check that the file round-trips — if it doesn't, we emit a
+    # warning but leave the file in place; load_workflow tolerates bad
+    # files by returning None so the user can see the error in the UI.
+    reloaded = load_workflow(project.workspace_dir)
+    return {
+        "ok": True,
+        "path": path,
+        "workflow": wf.model_dump(),
+        "reloaded_ok": reloaded is not None,
+    }
+
+
+@app.get("/api/workflow/raw")
+async def get_workflow_raw_legacy():
+    return _workflow_raw_payload(_project_or_404())
+
+
+@app.get("/api/projects/{project_id}/workflow/raw")
+async def get_workflow_raw_scoped(project_id: str):
+    return _workflow_raw_payload(_project_or_404(project_id))
+
+
+@app.put("/api/workflow/raw")
+async def put_workflow_raw_legacy(body: dict):
+    return _save_workflow_from_raw(_project_or_404(), body)
+
+
+@app.put("/api/projects/{project_id}/workflow/raw")
+async def put_workflow_raw_scoped(project_id: str, body: dict):
+    return _save_workflow_from_raw(_project_or_404(project_id), body)
+
+
+# ------------------------------------------------------------------ #
+#  Budget                                                             #
+# ------------------------------------------------------------------ #
+
+
+def _budget_payload(project: Project) -> dict:
+    return project.budget.snapshot()
+
+
+@app.get("/api/budget")
+async def get_budget_legacy():
+    return _budget_payload(_project_or_404())
+
+
+@app.get("/api/projects/{project_id}/budget")
+async def get_budget_scoped(project_id: str):
+    return _budget_payload(_project_or_404(project_id))
+
+
+@app.post("/api/budget/reset")
+async def reset_budget_legacy():
+    _project_or_404().budget.reset()
+    return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/budget/reset")
+async def reset_budget_scoped(project_id: str):
+    _project_or_404(project_id).budget.reset()
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ #

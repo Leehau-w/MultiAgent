@@ -1,13 +1,21 @@
 import { useState } from 'react'
 import { useAgentStore } from '../stores/agentStore'
-import { apiPost } from '../utils/api'
+import { apiDelete, apiPost } from '../utils/api'
 import AgentCard from './AgentCard'
 
 export default function Dashboard() {
-  const { agents, roles } = useAgentStore()
+  const { agents, roles, clearAgents } = useAgentStore()
   const [showCreate, setShowCreate] = useState(false)
   const [newRoleId, setNewRoleId] = useState('')
   const [newAgentId, setNewAgentId] = useState('')
+
+  const handleClearAll = async () => {
+    const count = Object.keys(agents).length
+    if (count === 0) return
+    if (!confirm(`Delete all ${count} agent${count === 1 ? '' : 's'}?`)) return
+    const res = await apiDelete('/api/agents')
+    if (res.ok) clearAgents()
+  }
 
   const handleCreate = async () => {
     if (!newRoleId) return
@@ -78,6 +86,17 @@ export default function Dashboard() {
               Cancel
             </button>
           </div>
+        )}
+
+        {agentList.length > 0 && (
+          <button
+            onClick={handleClearAll}
+            className="text-[11px] px-2 py-1 text-rose-300/80 border border-rose-900/60
+              hover:border-rose-700 hover:text-rose-200 rounded transition-colors"
+            title={`Stop + delete all ${agentList.length} agents`}
+          >
+            Clear all
+          </button>
         )}
       </div>
     </div>

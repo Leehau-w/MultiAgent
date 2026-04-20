@@ -56,3 +56,32 @@ class WSManager:
     @property
     def client_count(self) -> int:
         return len(self._connections)
+
+    # ------------------------------------------------------------------ #
+    #  Stage-gate helpers (v0.3.0)                                        #
+    # ------------------------------------------------------------------ #
+
+    async def stage_gate_review_started(
+        self, project_id: str, stage_name: str
+    ) -> None:
+        await self.broadcast_raw({
+            "type": "stage_gate_review_started",
+            "data": {"project_id": project_id, "stage_name": stage_name},
+        })
+
+    async def stage_gate_resolved(
+        self,
+        project_id: str,
+        stage_name: str,
+        verdict: str,
+        summary: str = "",
+    ) -> None:
+        await self.broadcast_raw({
+            "type": "stage_gate_resolved",
+            "data": {
+                "project_id": project_id,
+                "stage_name": stage_name,
+                "verdict": verdict,
+                "summary": summary,
+            },
+        })

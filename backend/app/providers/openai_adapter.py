@@ -83,6 +83,8 @@ class OpenAIAdapter(ProviderAdapter):
         session_id: str | None = None,
         effort: str | None = None,
         permission_callback: Callable[[str, dict], Awaitable[bool]] | None = None,
+        mcp_servers: dict | None = None,  # ignored — OpenAI has no MCP path
+        pid_callback: Callable[[int, int | None], None] | None = None,  # ignored — no subprocess
     ) -> AsyncIterator[ProviderMessage]:
         if not _OPENAI_AVAILABLE:
             yield ProviderMessage(

@@ -108,6 +108,10 @@ class PipelineStage(BaseModel):
     name: str
     agents: list[str]  # role ids
     parallel: bool = False
+    # Free-text criteria the coordinator compares each agent's output
+    # against during a stage-gate review. ``None`` → the coordinator uses
+    # its own judgement.
+    acceptance_criteria: str | None = None
 
 
 class StartPipelineRequest(BaseModel):

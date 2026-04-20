@@ -138,10 +138,27 @@ export default function AgentCard({ agent }: Props) {
   const barColor =
     contextPct >= 90 ? 'bg-red-500' : contextPct >= 70 ? 'bg-yellow-500' : 'bg-indigo-500'
 
+  const handleCardClick = () => {
+    // The coordinator has its own rich panel (Progress / State / Pipeline);
+    // click opens that modal rather than the generic ContextViewer.
+    if (isCoordinator) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const opener = (window as any).__openCoordinatorPanel as
+        | (() => void)
+        | undefined
+      if (opener) {
+        selectAgent(agent.id)
+        opener()
+        return
+      }
+    }
+    selectAgent(isSelected ? null : agent.id)
+  }
+
   return (
     <>
       <div
-        onClick={() => selectAgent(isSelected ? null : agent.id)}
+        onClick={handleCardClick}
         className={`
           relative w-[180px] rounded-lg border px-3 py-2 cursor-pointer
           transition-all select-none flex flex-col gap-1 group

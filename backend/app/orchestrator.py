@@ -11,11 +11,13 @@ import yaml
 
 from .models import (
     AgentRole,
+    AgentStatus,
     PermissionMode,
     PipelineStage,
     ProjectMeta,
 )
 from .project import Project
+from .workflow import load_workflow
 from .ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,57 @@ def _slugify(name: str) -> str:
     """Make a filesystem-safe slug from a folder name. Empty → 'project'."""
     s = _SLUG_RE.sub("-", name).strip("-")
     return s or "project"
+
+
+class _PipelineAborted(Exception):
+    """Internal sentinel — the coordinator called ``mark_done("ABORT: ...")``.
+
+    Raised by :meth:`Orchestrator._run_stage_with_gate` so ``run_pipeline``
+    can mark the run as ``failed`` (not ``error``) with the coord's reason.
+    """
+
+    def __init__(self, stage_name: str, reason: str) -> None:
+        super().__init__(reason)
+        self.stage_name = stage_name
+        self.reason = reason
+
+
+def _append_user_override_decision(
+    workspace_dir: str, decision: str, rationale: str,
+) -> None:
+    """Append a ``user_override`` entry to ``coordinator_state.yaml`` so the
+    decisions log shows force-advances alongside the coord's own choices.
+
+    Failure is logged and swallowed — a read-only filesystem should not
+    prevent the pipeline from resuming.
+    """
+    from .coordinator_state import (
+        DecisionEntry,
+        StateUpdate,
+        apply_update,
+        load_state,
+        save_state,
+    )
+
+    try:
+        state = load_state(workspace_dir)
+        new_state = apply_update(
+            state,
+            StateUpdate(
+                decisions_append=[
+                    DecisionEntry(
+                        decision=f"[user_override] {decision}",
+                        rationale=rationale,
+                    )
+                ],
+            ),
+        )
+        save_state(workspace_dir, new_state)
+    except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+        logger.warning(
+            "Could not persist user_override decision to %s: %s",
+            workspace_dir, exc,
+        )
 
 
 class Orchestrator:
@@ -203,19 +256,70 @@ class Orchestrator:
         stages: list[PipelineStage] | None = None,
     ) -> None:
         project = self.get_project(project_id)
+        wf = load_workflow(project.workspace_dir)
         if stages is None:
-            stages = self._default_pipeline()
+            stages = wf.stages if wf is not None else self._default_pipeline()
+
+        # Reset per-run pipeline state so a second run never inherits a
+        # stale gate verdict or retry counter from the previous run.
+        pipeline = project.reset_pipeline()
+
+        # Auto-spawn coordinator when workflow.coordinator.enabled is true.
+        # Idempotent: if a prior run or user action already created a
+        # ``coord`` agent, we reuse it. The coordinator drives every
+        # stage-gate decision from here onwards.
+        coord_enabled = (
+            wf is not None
+            and wf.coordinator is not None
+            and wf.coordinator.enabled
+        )
+        coord_role_id = (
+            wf.coordinator.role_id
+            if (wf is not None and wf.coordinator is not None)
+            else None
+        )
+        # Default cap of 3 is applied only when a stage-gate run is
+        # active — legacy ungated pipelines treat "no cap" as "no cap"
+        # (they never RETRY anyway). Explicit None in budget = unlimited.
+        raw_max_retries = (
+            wf.budget.max_stage_retries
+            if (wf is not None and wf.budget is not None)
+            else None
+        )
+        max_stage_retries = raw_max_retries if raw_max_retries is not None else 3
+        if coord_enabled and coord_role_id:
+            existing = project.agents.get("coord")
+            if existing is None:
+                try:
+                    project.create_agent(role_id=coord_role_id, agent_id="coord")
+                except ValueError as exc:
+                    logger.warning(
+                        "auto-spawn coordinator failed (role=%s): %s",
+                        coord_role_id, exc,
+                    )
+                    coord_enabled = False
+            elif existing.role_id != coord_role_id:
+                logger.warning(
+                    "existing 'coord' agent has role=%s but workflow expects %s; "
+                    "stage gate disabled for this run",
+                    existing.role_id, coord_role_id,
+                )
+                coord_enabled = False
+            if coord_enabled:
+                pipeline.coordinator_agent_id = "coord"
 
         await project.broadcast_raw({
             "type": "pipeline_status",
             "data": {
                 "status": "running",
                 "requirement": requirement[:200],
-                "stages": [s.model_dump() for s in stages],
+                "stages": [s.model_dump(exclude_none=True) for s in stages],
                 "current_stage": 0,
             },
         })
 
+        # Spawn every stage's workers up-front (matches prior behavior so
+        # the UI sees the full roster before stage 1 starts).
         stage_agents: list[list[str]] = []
         try:
             for stage in stages:
@@ -236,6 +340,14 @@ class Orchestrator:
                 "data": {"status": "error", "error": f"setup failed: {exc}"},
             })
             raise
+
+        # With workers registered, notify the coord that we're starting.
+        if pipeline.coordinator_agent_id:
+            await project._send_pipeline_started(
+                pipeline.coordinator_agent_id,
+                requirement,
+                [s.name for s in stages],
+            )
 
         pipeline_failed = False
         try:
@@ -259,29 +371,35 @@ class Orchestrator:
                         f"continue with the following requirement:\n\n{requirement}"
                     )
 
-                if stage.parallel:
-                    tasks = [
-                        project._run_agent(aid, stage_prompt, context_from=prior_ids)
-                        for aid in agent_ids
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for aid, result in zip(agent_ids, results):
-                        if isinstance(result, asyncio.CancelledError):
-                            raise result
-                        if isinstance(result, BaseException):
-                            logger.error(
-                                "Pipeline stage %s agent %s failed: %s",
-                                stage.name, aid, result,
-                            )
-                            pipeline_failed = True
-                else:
-                    for aid in agent_ids:
-                        await project._run_agent(aid, stage_prompt, context_from=prior_ids)
+                stage_failed = await self._run_stage_with_gate(
+                    project=project,
+                    pipeline=pipeline,
+                    stage=stage,
+                    agent_ids=agent_ids,
+                    prior_ids=prior_ids,
+                    stage_prompt=stage_prompt,
+                    max_stage_retries=max_stage_retries,
+                )
+                if stage_failed:
+                    pipeline_failed = True
 
             status = "error" if pipeline_failed else "completed"
             await project.broadcast_raw({
                 "type": "pipeline_status",
                 "data": {"status": status, "current_stage": len(stages)},
+            })
+        except _PipelineAborted as abort:
+            logger.info(
+                "Pipeline aborted at stage %s: %s",
+                abort.stage_name, abort.reason,
+            )
+            await project.broadcast_raw({
+                "type": "pipeline_status",
+                "data": {
+                    "status": "failed",
+                    "stage_name": abort.stage_name,
+                    "reason": abort.reason,
+                },
             })
         except asyncio.CancelledError:
             for ids in stage_agents:
@@ -298,6 +416,296 @@ class Orchestrator:
                 "type": "pipeline_status",
                 "data": {"status": "error", "error": str(exc)},
             })
+
+    async def _run_stage_with_gate(
+        self,
+        *,
+        project: "Project",
+        pipeline: "PipelineState",
+        stage: PipelineStage,
+        agent_ids: list[str],
+        prior_ids: list[str],
+        stage_prompt: str,
+        max_stage_retries: int | None,
+    ) -> bool:
+        """Run one stage, then loop review/rework until the coord APPROVEs.
+
+        Returns ``True`` if any agent's run raised an exception (pipeline
+        should be marked failed at the end), ``False`` otherwise. Does not
+        swallow ``CancelledError`` — the caller handles stop semantics.
+
+        When no coordinator is active (``pipeline.coordinator_agent_id`` is
+        None), the stage runs exactly once with no gate — preserves v0.2.0
+        behaviour for legacy / ungated pipelines.
+
+        ``max_stage_retries`` caps how many times a RETRY verdict can push
+        us back into the rework path. When the cap is reached, further
+        RETRY verdicts are refused with a [STAGE_RETRY_EXHAUSTED] message
+        and the loop waits for APPROVE (or pipeline abort / user override).
+        """
+        coord_id = pipeline.coordinator_agent_id
+        stage_name = stage.name
+        targets = list(agent_ids)
+        # When True, the next iteration skips re-running agents and only
+        # waits for a fresh verdict (coord previously asked for another
+        # retry after the budget was exhausted).
+        awaiting_post_exhaustion = False
+
+        stage_failed = False
+        while True:
+            if not awaiting_post_exhaustion:
+                if stage.parallel:
+                    tasks = [
+                        project._run_agent(aid, stage_prompt, context_from=prior_ids)
+                        for aid in targets
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for aid, result in zip(targets, results):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if isinstance(result, BaseException):
+                            logger.error(
+                                "Pipeline stage %s agent %s failed: %s",
+                                stage_name, aid, result,
+                            )
+                            stage_failed = True
+                else:
+                    for aid in targets:
+                        await project._run_agent(
+                            aid, stage_prompt, context_from=prior_ids,
+                        )
+
+            if coord_id is None:
+                return stage_failed
+
+            # Ask the coord to review this stage.
+            pipeline.current_stage_name = stage_name
+            pipeline.gate_verdict = None
+            pipeline.gate_verdict_ready.clear()
+            retries_so_far = pipeline.stage_retries.get(stage_name, 0)
+            budget_exhausted = (
+                max_stage_retries is not None
+                and retries_so_far >= max_stage_retries
+            )
+            if budget_exhausted:
+                await project._send_stage_retry_exhausted(
+                    coord_id, stage_name, retries_so_far,
+                    max_stage_retries or 0,
+                )
+            else:
+                await project._send_stage_complete(
+                    coord_id,
+                    stage_name,
+                    agent_ids,
+                    acceptance_criteria=stage.acceptance_criteria,
+                    retries_so_far=retries_so_far,
+                    max_retries=max_stage_retries or 0,
+                )
+            await project.ws.stage_gate_review_started(project.id, stage_name)
+
+            await pipeline.gate_verdict_ready.wait()
+            verdict = pipeline.gate_verdict
+            pipeline.gate_verdict = None
+            pipeline.gate_verdict_ready.clear()
+
+            # Pause path — coord crashed or user requested a pause.
+            # Broadcast pipeline_paused and wait for the user's resume.
+            if pipeline.pause_reason is not None:
+                reason = pipeline.pause_reason
+                logger.info(
+                    "[%s] pipeline paused at stage %s: %s",
+                    project.id, stage_name, reason[:120],
+                )
+                await project.broadcast_raw({
+                    "type": "pipeline_paused",
+                    "data": {
+                        "project_id": project.id,
+                        "stage_name": stage_name,
+                        "reason": reason,
+                    },
+                })
+
+                # Wait for /pipeline/resume → sets resume_action + fires event
+                pipeline.resume_ready.clear()
+                await pipeline.resume_ready.wait()
+                action = pipeline.resume_action
+                pipeline.pause_reason = None
+                pipeline.resume_action = None
+                pipeline.resume_ready.clear()
+
+                await project.broadcast_raw({
+                    "type": "pipeline_resumed",
+                    "data": {
+                        "project_id": project.id,
+                        "stage_name": stage_name,
+                        "action": action or "retry",
+                    },
+                })
+
+                if action == "force_advance":
+                    await project.ws.stage_gate_resolved(
+                        project.id, stage_name, "APPROVE",
+                        "User force-advanced past gate (resume)",
+                    )
+                    return stage_failed
+
+                # "retry" (default) — reset the coord if it's in error so
+                # send_message can restart it, then re-emit STAGE_COMPLETE
+                # on the next loop iteration.
+                if coord_id:
+                    coord_agent = project.agents.get(coord_id)
+                    if coord_agent and coord_agent.status == AgentStatus.ERROR:
+                        coord_agent.status = AgentStatus.IDLE
+                awaiting_post_exhaustion = True  # don't re-run stage agents
+                continue
+
+            if verdict is None:
+                logger.warning(
+                    "[%s] gate verdict missing after event fired; treating as APPROVE",
+                    project.id,
+                )
+                await project.ws.stage_gate_resolved(
+                    project.id, stage_name, "APPROVE",
+                    "auto-approved (missing verdict)",
+                )
+                return stage_failed
+
+            await project.ws.stage_gate_resolved(
+                project.id, stage_name, verdict.action, verdict.summary,
+            )
+
+            if verdict.action == "APPROVE":
+                return stage_failed
+
+            if verdict.action == "ABORT":
+                # Coordinator signalled unrecoverable failure — propagate
+                # via a sentinel exception so ``run_pipeline`` can mark the
+                # whole pipeline as failed and surface the reason to the
+                # user.  Summary carries the ``ABORT: ...`` reason.
+                raise _PipelineAborted(stage_name, verdict.summary)
+
+            if budget_exhausted:
+                # Coord tried to RETRY beyond the budget — refuse, stay
+                # in review-only mode, loop to wait for a better verdict.
+                logger.warning(
+                    "[%s] coord requested rework after retry budget "
+                    "exhausted (stage=%s retries=%d/%s); refusing",
+                    project.id, stage_name, retries_so_far, max_stage_retries,
+                )
+                awaiting_post_exhaustion = True
+                continue
+
+            # RETRY — re-run only the agents the coord listed. Unknown ids
+            # are silently dropped (coord may name an agent outside the
+            # stage in error; we don't want to surprise it by running a
+            # worker from a prior stage).
+            #
+            # Just-spawned agents from ``spawn_and_rework`` join the stage
+            # roster so subsequent STAGE_COMPLETE messages include them.
+            for new_aid in verdict.spawned_agents:
+                if new_aid in project.agents and new_aid not in agent_ids:
+                    agent_ids.append(new_aid)
+            rework_targets = [aid for aid in verdict.agents if aid in agent_ids]
+            if not rework_targets:
+                logger.warning(
+                    "[%s] rework requested with no valid agents (got %s, stage has %s); "
+                    "auto-approving to avoid loop",
+                    project.id, verdict.agents, agent_ids,
+                )
+                return stage_failed
+
+            pipeline.stage_retries[stage_name] = retries_so_far + 1
+            targets = rework_targets
+            stage_prompt = (
+                f"{stage_prompt}\n\n--- Rework instruction from coordinator ---\n"
+                f"{verdict.instruction}"
+            )
+            stage_failed = False  # fresh attempt
+            awaiting_post_exhaustion = False
+
+    # ------------------------------------------------------------------ #
+    #  Pause / resume                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def resume_pipeline(
+        self, project_id: str | None, action: str,
+    ) -> dict[str, str]:
+        """Un-pause a paused pipeline with the user's chosen action.
+
+        Called by the ``POST /api/projects/{slug}/pipeline/resume`` endpoint.
+        ``action`` must be ``"retry"`` (re-invoke the coord with the same
+        [STAGE_COMPLETE]) or ``"force_advance"`` (synthesize APPROVE and
+        advance).  Refuses when no pause is actually pending.
+        """
+        project = self.get_project(project_id)
+        pipeline = project.pipeline
+        if pipeline.pause_reason is None:
+            raise ValueError("Pipeline is not paused")
+        if action not in ("retry", "force_advance"):
+            raise ValueError(
+                f"Unknown resume action {action!r} — "
+                "must be 'retry' or 'force_advance'"
+            )
+        pipeline.resume_action = action  # type: ignore[assignment]
+        pipeline.resume_ready.set()
+        # Record the force-advance as a coordinator decision so the UI's
+        # decisions log shows the user override explicitly.
+        if action == "force_advance":
+            stage_name = pipeline.current_stage_name
+            rationale = pipeline.pause_reason or "coordinator failure"
+            decision_text = (
+                f"approved stage {stage_name} after coordinator failure"
+            )
+            _append_user_override_decision(
+                project.workspace_dir, decision_text, rationale,
+            )
+            await project.broadcast_raw({
+                "type": "coordinator_decision",
+                "data": {
+                    "scope": "user_override",
+                    "decision": decision_text,
+                    "rationale": rationale,
+                },
+            })
+        return {"ok": "true", "action": action}
+
+    async def approve_stage_from_user(
+        self, project_id: str | None, summary: str = "",
+    ) -> dict[str, str]:
+        """User-driven approve (``POST /api/projects/{slug}/pipeline/approve``).
+
+        When a stage review is pending (gate_verdict still None), synthesize
+        an APPROVE verdict so the orchestrator advances.  Used both for the
+        blocker-notification "Override & continue" button and for a manual
+        approve when the coord is taking too long.
+        """
+        from .project import GateVerdict
+
+        project = self.get_project(project_id)
+        pipeline = project.pipeline
+        if pipeline.current_stage_name is None:
+            raise ValueError("No stage is currently under gate review")
+        if pipeline.gate_verdict is not None:
+            raise ValueError("A verdict has already been recorded")
+        reason = summary or "User manually approved stage"
+        pipeline.gate_verdict = GateVerdict(
+            action="APPROVE", summary=f"User override: {reason}",
+        )
+        pipeline.gate_verdict_ready.set()
+        stage_name = pipeline.current_stage_name
+        decision_text = f"approved stage {stage_name}"
+        _append_user_override_decision(
+            project.workspace_dir, decision_text, reason,
+        )
+        await project.broadcast_raw({
+            "type": "coordinator_decision",
+            "data": {
+                "scope": "user_override",
+                "decision": decision_text,
+                "rationale": reason,
+            },
+        })
+        return {"ok": "true", "stage_name": stage_name}
 
     def _default_pipeline(self) -> list[PipelineStage]:
         return [

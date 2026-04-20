@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useAgentStore } from '../stores/agentStore'
-import { apiPost } from '../utils/api'
+import { useToastStore } from '../stores/toastStore'
+import { apiDelete, apiFetch, apiPost, apiPut } from '../utils/api'
 
 interface Stage {
   name: string
@@ -25,6 +26,47 @@ export default function PipelineModal({ open, onClose }: Props) {
   const [requirement, setRequirement] = useState('')
   const [stages, setStages] = useState<Stage[]>(DEFAULT_STAGES)
   const [submitting, setSubmitting] = useState(false)
+  const [savingWorkflow, setSavingWorkflow] = useState(false)
+  const [source, setSource] = useState<'default' | 'workflow'>('default')
+
+  // On open, load the project's workflow.yaml (if any) so the editor
+  // starts from the user's last-saved pipeline rather than the
+  // hardcoded default.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await apiFetch('/api/workflow')
+        if (cancelled) return
+        if (!res.ok) {
+          setStages(DEFAULT_STAGES)
+          setSource('default')
+          return
+        }
+        const data = await res.json()
+        if (data?.exists && Array.isArray(data.workflow?.stages)) {
+          setStages(
+            data.workflow.stages.map((s: Stage) => ({
+              name: s.name,
+              agents: [...s.agents],
+              parallel: Boolean(s.parallel),
+            })),
+          )
+          setSource('workflow')
+        } else {
+          setStages(DEFAULT_STAGES)
+          setSource('default')
+        }
+      } catch {
+        setStages(DEFAULT_STAGES)
+        setSource('default')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [open])
 
   if (!open) return null
 
@@ -71,22 +113,44 @@ export default function PipelineModal({ open, onClose }: Props) {
     setStages((prev) => prev.filter((_, idx) => idx !== i))
   }
 
+  const stagesForApi = () =>
+    stages.map((s) => ({
+      name: s.name.toLowerCase(),
+      agents: s.agents,
+      parallel: s.parallel,
+    }))
+
   const handleStart = async () => {
     if (!requirement.trim() || stages.length === 0) return
     setSubmitting(true)
     const res = await apiPost('/api/pipeline/start', {
       requirement: requirement.trim(),
-      stages: stages.map((s) => ({
-        name: s.name.toLowerCase(),
-        agents: s.agents,
-        parallel: s.parallel,
-      })),
+      stages: stagesForApi(),
     })
     setSubmitting(false)
     if (res.ok) {
       onClose()
       setRequirement('')
-      setStages(DEFAULT_STAGES)
+    }
+  }
+
+  const handleSaveAsDefault = async () => {
+    if (stages.length === 0) return
+    setSavingWorkflow(true)
+    const res = await apiPut('/api/workflow', { stages: stagesForApi() })
+    setSavingWorkflow(false)
+    if (res.ok) {
+      setSource('workflow')
+      useToastStore.getState().add('success', 'Saved as project default')
+    }
+  }
+
+  const handleResetToDefaults = async () => {
+    setStages(DEFAULT_STAGES)
+    const res = await apiDelete('/api/workflow')
+    if (res.ok) {
+      setSource('default')
+      useToastStore.getState().add('success', 'Reverted to built-in defaults')
     }
   }
 
@@ -101,6 +165,15 @@ export default function PipelineModal({ open, onClose }: Props) {
           <h2 className="text-white font-semibold text-base">Start Pipeline</h2>
           <p className="text-gray-500 text-xs mt-1">
             Define the requirement and configure execution stages.
+          </p>
+          <p className="text-[10px] mt-1.5">
+            {source === 'workflow' ? (
+              <span className="text-indigo-400">
+                Loaded from <code className="text-indigo-300">workflow.yaml</code>
+              </span>
+            ) : (
+              <span className="text-gray-500">Using built-in defaults (no workflow.yaml)</span>
+            )}
           </p>
         </div>
 
@@ -202,20 +275,41 @@ export default function PipelineModal({ open, onClose }: Props) {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-gray-800 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-sm text-gray-400 hover:text-gray-200"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleStart}
-            disabled={!requirement.trim() || stages.length === 0 || submitting}
-            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm rounded-md transition-colors"
-          >
-            {submitting ? 'Starting...' : 'Start Pipeline'}
-          </button>
+        <div className="px-5 py-3 border-t border-gray-800 flex justify-between items-center gap-2">
+          <div className="flex gap-2">
+            <button
+              onClick={handleSaveAsDefault}
+              disabled={stages.length === 0 || savingWorkflow}
+              className="px-3 py-1.5 text-xs text-gray-300 border border-gray-700 rounded-md hover:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed"
+              title="Persist these stages to workflow.yaml so future pipelines reuse them"
+            >
+              {savingWorkflow ? 'Saving…' : 'Save as default'}
+            </button>
+            {source === 'workflow' && (
+              <button
+                onClick={handleResetToDefaults}
+                className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-300"
+                title="Remove workflow.yaml and fall back to the built-in pipeline"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="px-3 py-1.5 text-sm text-gray-400 hover:text-gray-200"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleStart}
+              disabled={!requirement.trim() || stages.length === 0 || submitting}
+              className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm rounded-md transition-colors"
+            >
+              {submitting ? 'Starting...' : 'Start Pipeline'}
+            </button>
+          </div>
         </div>
       </div>
     </div>
