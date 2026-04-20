@@ -80,6 +80,20 @@ reviewer:
 - **Usage tracking** — token counts and cost per agent
 - **Session resume** — continue conversations with agents
 
+### New in v0.3.1
+
+- **Stuck-agent watchdog** — flags any `RUNNING` agent with no stream activity past 8 min as `stuck`; recovers automatically on next provider message. Visible as a pulsing rose dot on the agent card.
+- **Coordinator restart tool** — `restart_agent(agent_id, prompt)` tree-kills a wedged CLI subprocess and re-runs the worker with a fresh prompt (session_id preserved).
+- **WebSocket fan-out fix** — broadcasts no longer serialize behind a global lock; slow or backgrounded browser tabs can't wedge the SDK control channel anymore.
+- **Budget sticky-flag hotfix** — raising a cap in `workflow.yaml` now clears a stale `BudgetExceeded` trip on the next start.
+
+### New in v0.3.0
+
+- **Stage-gate pipeline** — stages run to completion, then the coordinator reviews against `acceptance_criteria` before advancing; pause/retry/force-advance controls in the pipeline banner.
+- **User ↔ coordinator dialog** — message the coord directly from the chat panel; coord decisions and user overrides are logged with rationale.
+- **Pipeline-level status UI** — pipeline banner, workflow graph with current-stage highlight, error panel, and desktop-style notifications (info / warning / blocker).
+- **Permission panel** — cross-agent permission request queue with per-request approve/deny; global mode (`manual` / `workspace` / `bypass`) with per-agent override.
+
 ### New in v0.2.0
 
 - **Declarative workflows** — `workflow.yaml` per project with stages, budget, triggers, coordinator config; UI editor under the **Workflow** button. See [workflow guide](./docs/workflow-guide.md).
